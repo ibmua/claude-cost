@@ -136,12 +136,22 @@ function scanSession(file) {
   }
   const breakdown = [...models.values()].sort((a, b) => b.usd - a.usd);
   const mainModel = [...models.values()].sort((a, b) => (b.main || 0) - (a.main || 0))[0]?.model || "unknown";
+  // model can be switched mid-session (/model); cells preserves first-seen order per main-lane model
+  const mainModels = [...cells.keys()]
+    .filter((k) => k.endsWith("|main"))
+    .map((k) => k.split("|")[0])
+    .filter((m) => m !== "unknown" && m !== "<synthetic>");
+  const chain = (mainModels.length ? mainModels : [mainModel]).map((m) => m.replace(/^claude-/, ""));
+  const chainLabel = chain.length > 3
+    ? chain.slice(0, 3).join("→") + "→+" + (chain.length - 3)
+    : chain.join("→");
   const displayCwd = isSubagentFile
     ? `claude/subagent/${subagentName || "subagent"}/${cwd || "(unknown)"}`
-    : `${mainModel} ${cwd || "(unknown)"}`;
+    : `${chainLabel} ${cwd || "(unknown)"}`;
   return {
     id: file.split("/").pop().replace(".jsonl", ""),
     cwd: displayCwd,
+    mainModels,
     first, last, msgs, usd, tokens, unpriced, breakdown, lane, cat,
     realCwd: cwd,
     parentSessionId: isSubagentFile ? file.split("/").at(-3) : null,
@@ -189,7 +199,7 @@ function mergeClaudeSubagent(parent, sub) {
 
 async function scanCodex(file) {
   let model = null, first = null, last = null, msgs = 0, total = null;
-  let cwd = null, laneName = "main", subagentName = null, parentThreadId = null;
+  let cwd = null, threadId = null, parentThreadId = null;
   const rl = createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
@@ -197,10 +207,16 @@ async function scanCodex(file) {
       try {
         const meta = JSON.parse(line).payload || {};
         cwd = meta.cwd || cwd;
+        threadId = threadId || meta.id;
         parentThreadId = meta.parent_thread_id || parentThreadId;
         if (meta.thread_source === "subagent" || meta.source?.subagent) {
-          laneName = "sub";
-          subagentName = codexSubagentName(meta.source);
+          // Subagent rollouts replay the parent's whole history and inherit its
+          // cumulative total_token_usage counter — summing them double-counts the
+          // parent's work once per subagent (~7.7x inflation measured). The parent
+          // main session's final total already includes all subagent usage, so
+          // skip these files entirely (also saves streaming GBs of replayed log).
+          rl.close();
+          return { codexSubagentOf: parentThreadId, name: codexSubagentName(meta.source) };
         }
       } catch {}
     }
@@ -234,15 +250,13 @@ async function scanCodex(file) {
     usd = cat.in + cat.cr + cat.out;
   } else unpriced = true;
   const tokens = inputTot + out;
-  const lane = { main: 0, sub: 0 };
-  lane[laneName] = usd;
-  const label = laneName === "sub"
-    ? `codex/subagent/${subagentName || "subagent"}/${model || "?"}`
-    : "codex/" + (model || "?");
+  // total_token_usage on a main thread is cumulative across the whole
+  // parent+subagent tree, so this single number already covers subagent work.
   return {
     source: "codex",
     id: file.split("/").pop().replace("rollout-", "").replace(".jsonl", "").slice(0, 33),
-    cwd: label,
+    threadId,
+    cwd: "codex/" + (model || "?"),
     first, last, msgs, usd, tokens, unpriced,
     breakdown: [{
       model: model || "?",
@@ -251,11 +265,10 @@ async function scanCodex(file) {
       cw: 0,
       cr: cached,
       usd,
-      sub: laneName === "sub" ? usd : 0,
+      sub: 0,
     }],
-    lane,
+    lane: { main: usd, sub: 0 },
     cat,
-    parentThreadId,
     realCwd: cwd,
   };
 }
@@ -287,8 +300,21 @@ async function collect() {
   let codexFiles = [];
   try { codexFiles = walk(CODEX_ROOT); } catch {}
   const codex = [];
+  const codexSubCount = new Map(); // parent threadId -> spawned subagent threads
   for (const f of codexFiles) {
-    try { codex.push(await cachedScan(f, scanCodex)); } catch {}
+    try {
+      const r = await cachedScan(f, scanCodex);
+      if (!r) continue;
+      if (r.codexSubagentOf !== undefined) {
+        if (r.codexSubagentOf)
+          codexSubCount.set(r.codexSubagentOf, (codexSubCount.get(r.codexSubagentOf) || 0) + 1);
+        continue;
+      }
+      codex.push(r);
+    } catch {}
+  }
+  for (const s of codex) {
+    if (codexSubCount.has(s.threadId)) s.subagentCount = codexSubCount.get(s.threadId);
   }
   const sessions = [...claude, ...codex].filter((s) => s && s.tokens > 0);
   sessions.sort((a, b) => (b.last || "").localeCompare(a.last || ""));
@@ -329,6 +355,8 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  .warn{color:#f59e0b} .big{color:#f87171;font-weight:600}
  .cr{color:#fbbf24} td.cr{color:#fbbf24}
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
+ tr.month td{background:#141927;color:#a8b0c2;font-size:12px;border-top:1px solid #2a3147;border-bottom:1px solid #2a3147;padding:9px 12px}
+ tr.month b{color:#e6e6e6}
  .detail{padding:8px 0 14px}
  table.inner{width:auto;margin:2px 0 2px 8px;border:1px solid #262b38;border-radius:8px;overflow:hidden}
  table.inner th,table.inner td{border-bottom:1px solid #20242f;padding:5px 14px;font-size:12px}
@@ -392,6 +420,14 @@ function displayName(s){
  if(s.source==='claude') name=name.replace(/^claude-/,'');
  return name;
 }
+function modelSwitch(s){
+ if(!s.mainModels||s.mainModels.length<2)return '';
+ return ' <span class=pill title="model switched mid-session: '+s.mainModels.map(shortModel).join(' → ')+'">🔀</span>';
+}
+function subCount(s){
+ if(s.source!=='codex'||!s.subagentCount)return '';
+ return ' <span class=pill title="spawned '+s.subagentCount+' subagent thread(s); their usage is already included in this session\'s totals">🤖×'+s.subagentCount+'</span>';
+}
 function subworkerModels(s){
  const models=[...new Set((s.breakdown||[]).filter(b=>(b.sub||0)>0).map(b=>shortModel(b.model)))];
  if(!models.length)return '';
@@ -413,13 +449,27 @@ function render(){
   return (x<y?-1:x>y?1:0)*(desc?-1:1);});
  const tb=document.querySelector('#t tbody');tb.innerHTML='';
  const bigCut=st.mode==='plan'?3*Math.min(ratio('claude'),ratio('codex')):3;
+ // monthly summary rows (only when sorted chronologically)
+ const byMonth=new Map();
+ if(sortK==='when')for(const s of rows){
+  const mk=(s.last||'').slice(0,7);
+  const g=byMonth.get(mk)||{n:0,usd:0,api:0,cld:0,cdx:0,tok:0};
+  g.n++;g.usd+=s.usd*fac(s);g.api+=s.usd;g.tok+=s.tokens;
+  if(s.source==='codex')g.cdx+=s.usd*fac(s);else g.cld+=s.usd*fac(s);
+  byMonth.set(mk,g);
+ }
+ let curMonth=null;
  for(const s of rows){
+  if(sortK==='when'){
+   const mk=(s.last||'').slice(0,7);
+   if(mk!==curMonth){curMonth=mk;tb.appendChild(monthRow(mk,byMonth.get(mk)));}
+  }
   const f=fac(s);
-  const tr=document.createElement('tr');tr.style.cursor='pointer';
+  const tr=document.createElement('tr');tr.style.cursor='pointer';tr.className='s';
   const badge=s.source==='codex'?'<span class="pill cdx">codex</span> ':'<span class="pill cld">claude</span> ';
   tr.innerHTML=
    '<td class="l mono dim">'+when(s)+'</td>'+
-   '<td class="l proj mono">'+badge+displayName(s)+subworkerModels(s)+'</td>'+
+   '<td class="l proj mono">'+badge+displayName(s)+modelSwitch(s)+subCount(s)+subworkerModels(s)+'</td>'+
    '<td>'+fmt(s.msgs)+'</td>'+
    '<td class=dim>'+durStr(s.dur)+'</td>'+
    '<td>'+fmt(s.tokens)+'</td>'+
@@ -438,6 +488,14 @@ function render(){
  }
  renderTotals(rows);
  markSort();
+}
+function monthRow(mk,g){
+ const tr=document.createElement('tr');tr.className='month';
+ const name=mk?new Date(mk+'-15T00:00:00').toLocaleString('en',{month:'long',year:'numeric'}):'(no date)';
+ tr.innerHTML='<td colspan=12 class=l>📅 <b>'+name+'</b> · '+g.n+' sessions · <b>'+money(g.usd)+'</b>'+
+  (st.mode==='plan'?' <span class=dim>(🧾 '+money(g.api)+' API value)</span>':'')+
+  ' · 🟠 '+money(g.cld)+' · 🟢 '+money(g.cdx)+' · '+fmt(g.tok)+' tok';
+ return tr;
 }
 function detailHTML(s,f){
  const rows=s.breakdown.map(b=>
@@ -515,7 +573,7 @@ fetch('/api').then(r=>r.json()).then(d=>{
  data=d.sessions.map(enrich);
  render();
  const n=+urlQ.get('expand')||0;
- document.querySelectorAll('#t > tbody > tr:nth-child(odd)').forEach((tr,i)=>{if(i<n)tr.click();});
+ document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
 });
 </script></body></html>`;
 
