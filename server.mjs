@@ -198,8 +198,17 @@ function mergeClaudeSubagent(parent, sub) {
 }
 
 async function scanCodex(file) {
-  let model = null, first = null, last = null, msgs = 0, total = null;
+  let model = null, first = null, last = null, msgs = 0, total = null, totalCount = 0;
   let cwd = null, threadId = null, parentThreadId = null;
+  let isSub = false, subName = null;
+  // Per-turn usage summed over every token_count event. Subagent rollouts carry
+  // their OWN fresh counters (verified June 2026: first totals ≈ first turn's
+  // last_token_usage, zero replayed token_count events) and the parent thread's
+  // counter does NOT include them, so their usage is real and must be counted.
+  // (An earlier version skipped subagent files as "double-counted" — that was
+  // wrong and undercounted Codex ~20x in subagent-heavy months.)
+  const sum = { in: 0, cached: 0, out: 0 };
+  const num = (str, k) => { const m = str.match(new RegExp(`"${k}":(\\d+)`)); return m ? +m[1] : 0; };
   const rl = createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
@@ -210,13 +219,8 @@ async function scanCodex(file) {
         threadId = threadId || meta.id;
         parentThreadId = meta.parent_thread_id || parentThreadId;
         if (meta.thread_source === "subagent" || meta.source?.subagent) {
-          // Subagent rollouts replay the parent's whole history and inherit its
-          // cumulative total_token_usage counter — summing them double-counts the
-          // parent's work once per subagent (~7.7x inflation measured). The parent
-          // main session's final total already includes all subagent usage, so
-          // skip these files entirely (also saves streaming GBs of replayed log).
-          rl.close();
-          return { codexSubagentOf: parentThreadId, name: codexSubagentName(meta.source) };
+          isSub = true;
+          subName = codexSubagentName(meta.source);
         }
       } catch {}
     }
@@ -230,15 +234,31 @@ async function scanCodex(file) {
       const t = line.match(/"timestamp":"([^"]+)"/); if (t) last = t[1];
     }
     if (line.includes('"total_token_usage"')) {
-      const m = line.match(/"total_token_usage":\{([^}]*)\}/);
-      if (m) { total = m[1]; msgs++; }
+      const mt = line.match(/"total_token_usage":\{([^}]*)\}/);
+      if (mt) { total = mt[1]; totalCount++; }
+      const ml = line.match(/"last_token_usage":\{([^}]*)\}/);
+      if (ml) {
+        msgs++;
+        sum.in += num(ml[1], "input_tokens");
+        sum.cached += num(ml[1], "cached_input_tokens");
+        sum.out += num(ml[1], "output_tokens");
+      }
     }
   }
-  if (!total) return null;
-  const num = (k) => { const m = total.match(new RegExp(`"${k}":(\\d+)`)); return m ? +m[1] : 0; };
-  const inputTot = num("input_tokens");          // includes cached
-  const cached = num("cached_input_tokens");
-  const out = num("output_tokens");               // includes reasoning
+  // Fallback for old log formats without per-turn last_token_usage: use the
+  // final cumulative counter (fine for main threads, which never reset).
+  if (!sum.in && !sum.out && total) {
+    sum.in = num(total, "input_tokens");
+    sum.cached = num(total, "cached_input_tokens");
+    sum.out = num(total, "output_tokens");
+    msgs = totalCount;
+  }
+  if (!sum.in && !sum.out) {
+    return isSub ? { threadId, codexSubagentOf: parentThreadId || "", subName, empty: true } : null;
+  }
+  const inputTot = sum.in;                        // includes cached
+  const cached = sum.cached;
+  const out = sum.out;                            // includes reasoning
   const uncached = Math.max(0, inputTot - cached);
   const p = openaiPrice(model);
   let usd = 0, unpriced = false;
@@ -250,12 +270,12 @@ async function scanCodex(file) {
     usd = cat.in + cat.cr + cat.out;
   } else unpriced = true;
   const tokens = inputTot + out;
-  // total_token_usage on a main thread is cumulative across the whole
-  // parent+subagent tree, so this single number already covers subagent work.
   return {
     source: "codex",
     id: file.split("/").pop().replace("rollout-", "").replace(".jsonl", "").slice(0, 33),
     threadId,
+    codexSubagentOf: isSub ? parentThreadId || "" : undefined,
+    subName,
     cwd: "codex/" + (model || "?"),
     first, last, msgs, usd, tokens, unpriced,
     breakdown: [{
@@ -300,21 +320,55 @@ async function collect() {
   let codexFiles = [];
   try { codexFiles = walk(CODEX_ROOT); } catch {}
   const codex = [];
-  const codexSubCount = new Map(); // parent threadId -> spawned subagent threads
+  const codexSubs = [];
+  const codexByThread = new Map(); // main threadId -> session row
+  // cachedScan returns shared objects; clone before the merge below mutates them.
+  const cloneRow = (r) => ({
+    ...r,
+    breakdown: (r.breakdown || []).map((b) => ({ ...b })),
+    lane: r.lane && { ...r.lane },
+    cat: r.cat && { ...r.cat },
+  });
   for (const f of codexFiles) {
     try {
-      const r = await cachedScan(f, scanCodex);
-      if (!r) continue;
+      const cachedRow = await cachedScan(f, scanCodex);
+      if (!cachedRow) continue;
+      const r = cachedRow.empty ? { ...cachedRow } : cloneRow(cachedRow);
       if (r.codexSubagentOf !== undefined) {
-        if (r.codexSubagentOf)
-          codexSubCount.set(r.codexSubagentOf, (codexSubCount.get(r.codexSubagentOf) || 0) + 1);
+        codexSubs.push(r);
         continue;
       }
       codex.push(r);
+      if (r.threadId) codexByThread.set(r.threadId, r);
     } catch {}
   }
-  for (const s of codex) {
-    if (codexSubCount.has(s.threadId)) s.subagentCount = codexSubCount.get(s.threadId);
+  // Fold subagent rollouts into their top-level session (same as Claude
+  // sidechains), following parent links through nested subagents (e.g. a
+  // guardian spawned by a thread_spawn agent); orphans are listed standalone.
+  const subByThread = new Map();
+  for (const s of codexSubs) if (s.threadId) subByThread.set(s.threadId, s);
+  const resolveMain = (id) => {
+    for (let depth = 0; id && depth < 20; depth++) {
+      const main = codexByThread.get(id);
+      if (main) return main;
+      const sub = subByThread.get(id);
+      if (!sub) return null;
+      id = sub.codexSubagentOf;
+    }
+    return null;
+  };
+  for (const s of codexSubs) {
+    const parent = resolveMain(s.codexSubagentOf);
+    if (s.empty) {
+      if (parent) parent.subagentCount = (parent.subagentCount || 0) + 1;
+      continue;
+    }
+    if (parent) {
+      mergeClaudeSubagent(parent, s);
+    } else {
+      s.cwd = `codex/subagent/${s.subName || "subagent"}/${s.cwd.replace(/^codex\//, "")}`;
+      codex.push(s);
+    }
   }
   const sessions = [...claude, ...codex].filter((s) => s && s.tokens > 0);
   sessions.sort((a, b) => (b.last || "").localeCompare(a.last || ""));
@@ -341,6 +395,12 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  input.search{background:#0f1117;color:#e6e6e6;border:1px solid #262b38;border-radius:8px;padding:6px 10px;font-size:13px;width:190px;margin-left:auto}
  input.search:focus{outline:none;border-color:#3b4664}
  .totals{display:flex;gap:14px;padding:14px 24px;flex-wrap:wrap}
+ .loading{display:flex;align-items:center;gap:12px;color:#8b93a7;font-size:13px}
+ .pbar{width:180px;height:7px;background:#262b38;border-radius:5px;overflow:hidden;position:relative}
+ .pbar>div{position:absolute;height:100%;width:40%;border-radius:5px;background:linear-gradient(90deg,#34d399,#7dd3fc);animation:slide 1.1s ease-in-out infinite}
+ @keyframes slide{0%{left:-40%}100%{left:100%}}
+ .loaderr{color:#f87171;font-size:13px}
+ .loaderr button{background:#26304a;color:#fff;border:0;border-radius:6px;padding:4px 10px;margin-left:8px;cursor:pointer;font-size:12px}
  .card{background:#161a23;border:1px solid #262b38;border-radius:10px;padding:10px 16px;min-width:104px}
  .card .n{font-size:21px;font-weight:600}
  .card .l{color:#8b93a7;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-top:1px}
@@ -357,6 +417,19 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
  tr.month td{background:#141927;color:#a8b0c2;font-size:12px;border-top:1px solid #2a3147;border-bottom:1px solid #2a3147;padding:9px 12px}
  tr.month b{color:#e6e6e6}
+ details.prices{margin:0 24px 8px;background:#161a23;border:1px solid #262b38;border-radius:10px}
+ details.prices>summary{cursor:pointer;padding:10px 16px;font-size:13px;color:#a8b0c2;user-select:none;list-style:none}
+ details.prices>summary::-webkit-details-marker{display:none}
+ details.prices>summary:hover{color:#cdd3e0}
+ details.prices[open]>summary{border-bottom:1px solid #262b38}
+ .priceGrid{display:flex;gap:18px;flex-wrap:wrap;padding:12px 16px 14px}
+ .priceGrid h3{margin:0 0 6px;font-size:12px;color:#a8b0c2;font-weight:600}
+ table.price{border-collapse:collapse;font-variant-numeric:tabular-nums}
+ table.price th,table.price td{padding:4px 12px;text-align:right;border-bottom:1px solid #20242f;font-size:12px}
+ table.price th{position:static;background:none;color:#8b93a7;cursor:default;font-weight:500;white-space:nowrap}
+ table.price td.l,table.price th.l{text-align:left}
+ table.price td.l{color:#7dd3fc;font-family:ui-monospace,monospace}
+ table.price .raw{color:#5b6373;font-size:10px}
  .detail{padding:8px 0 14px}
  table.inner{width:auto;margin:2px 0 2px 8px;border:1px solid #262b38;border-radius:8px;overflow:hidden}
  table.inner th,table.inner td{border-bottom:1px solid #20242f;padding:5px 14px;font-size:12px}
@@ -377,7 +450,8 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  </div>
  <div class=sub id=subNote></div>
 </header>
-<div class=totals id=totals></div>
+<div class=totals id=totals><div class=loading id=loading>⏳ Scanning Claude &amp; Codex session logs… <div class=pbar><div></div></div></div></div>
+<details class=prices id=pricesPanel><summary id=pricesSummary>💲 Model prices (per 1M tokens)</summary><div class=priceGrid id=priceGrid></div></details>
 <div class=wrap><table id=t><thead><tr>
  <th class=l data-k=when>When</th><th class=l data-k=proj>Project</th>
  <th data-k=msgs>Msgs</th><th data-k=dur>Dur</th><th data-k=tokens>Tokens</th>
@@ -386,7 +460,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  <th data-k=sub>$ subwork</th><th data-k=usd>$ Total</th><th data-k=cacheshare>cache%</th>
 </tr></thead><tbody></tbody></table></div>
 <script>
-let data=[], sortK='when', desc=true, q='';
+let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}};
 const MONEYK={din:1,dout:1,dcw:1,dcr:1,sub:1,usd:1};
 // [id, plan $/mo, max possible API-value spend $/mo] — effective rate = price/max
 const PLANS={
@@ -426,7 +500,7 @@ function modelSwitch(s){
 }
 function subCount(s){
  if(s.source!=='codex'||!s.subagentCount)return '';
- return ' <span class=pill title="spawned '+s.subagentCount+' subagent thread(s); their usage is already included in this session\'s totals">🤖×'+s.subagentCount+'</span>';
+ return ' <span class=pill title="spawned '+s.subagentCount+' subagent thread(s); their usage is merged into this session\\'s totals">🤖×'+s.subagentCount+'</span>';
 }
 function subworkerModels(s){
  const models=[...new Set((s.breakdown||[]).filter(b=>(b.sub||0)>0).map(b=>shortModel(b.model)))];
@@ -487,6 +561,7 @@ function render(){
   tb.appendChild(tr);tb.appendChild(det);
  }
  renderTotals(rows);
+ renderPrices();
  markSort();
 }
 function monthRow(mk,g){
@@ -535,6 +610,35 @@ function renderTotals(rows){
   card(money(c.cw)+pct(c.cw),'cache write')+card(money(c.cr)+pct(c.cr),'cache read')+
   card(money(c.sub)+pct(c.sub),'subworkers');
 }
+function priceCell(raw,f){
+ if(raw==null)return '<td class=dim>—</td>';
+ const eff=raw*f;
+ const main='$'+(eff<1?eff.toFixed(eff<0.1?3:2):eff.toFixed(2));
+ if(f===1)return '<td>'+main+'</td>';
+ return '<td>'+main+'<div class=raw title="API list price">$'+raw+'</div></td>';
+}
+function renderPrices(){
+ const plan=st.mode==='plan';
+ const fC=ratio('claude'), fO=ratio('codex');
+ // Claude models: input / output / cache-write / cache-read per 1M tok
+ const cRows=Object.entries(prices.claude).map(([m,p])=>
+  '<tr><td class=l>'+shortModel(m)+'</td>'+priceCell(p.in,fC)+priceCell(p.out,fC)+
+  priceCell(p.cw,fC)+priceCell(p.cr,fC)+'</tr>').join('');
+ // OpenAI/Codex models: input / cached input / output per 1M tok
+ const oRows=Object.entries(prices.openai).map(([m,p])=>
+  '<tr><td class=l>'+m+'</td>'+priceCell(p.in,fO)+priceCell(p.cached,fO)+
+  priceCell(p.out,fO)+'</tr>').join('');
+ const note=plan?' <span class=raw style=font-size:11px>(effective rate; API list price below)</span>':'';
+ $('pricesSummary').innerHTML='💲 Model prices (per 1M tokens) — '+
+  (plan?'📦 '+planOf('claude')[0]+' / '+planOf('codex')[0]+' effective rates':'🧾 API list prices');
+ $('priceGrid').innerHTML=
+  '<div><h3>🟠 Claude'+(plan?' '+ratioStr('claude'):'')+note+'</h3>'+
+  '<table class=price><thead><tr><th class=l>model</th><th>input</th><th>output</th>'+
+  '<th>cache&nbsp;write</th><th>cache&nbsp;read</th></tr></thead><tbody>'+cRows+'</tbody></table></div>'+
+  '<div><h3>🟢 OpenAI / Codex'+(plan?' '+ratioStr('codex'):'')+'</h3>'+
+  '<table class=price><thead><tr><th class=l>model</th><th>input</th><th>cached&nbsp;in</th>'+
+  '<th>output</th></tr></thead><tbody>'+oRows+'</tbody></table></div>';
+}
 function markSort(){
  document.querySelectorAll('#t thead th').forEach(th=>{
   const on=th.dataset.k===sortK;
@@ -569,19 +673,27 @@ function initControls(){
  syncControls();
 }
 initControls();
-fetch('/api').then(r=>r.json()).then(d=>{
- data=d.sessions.map(enrich);
- render();
- const n=+urlQ.get('expand')||0;
- document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
-});
+function loadData(){
+ const lo=$('loading'); if(lo)lo.innerHTML='⏳ Scanning Claude &amp; Codex session logs… <div class=pbar><div></div></div>';
+ fetch('/api').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+  data=d.sessions.map(enrich);
+  if(d.prices)prices=d.prices;
+  render();
+  const n=+urlQ.get('expand')||0;
+  document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
+ }).catch(err=>{
+  $('totals').innerHTML='<div class=loaderr>⚠️ Failed to load session data: '+err.message+
+   '<button onclick="loadData()">↻ Retry</button></div>';
+ });
+}
+loadData();
 </script></body></html>`;
 
 createServer(async (req, res) => {
   if (req.url === "/api") {
     const sessions = await collect();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions }));
+    res.end(JSON.stringify({ sessions, prices: { claude: PRICES, openai: OPENAI_PRICES } }));
   } else {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(PAGE);
