@@ -365,8 +365,11 @@ const PLANS={
  claude:[['claude-pro',20,400],['claude-max-5x',100,2000],['claude-max-20x',200,8000]],
  codex:[['chatgpt-plus',20,700],['chatgpt-pro-5x',100,3500],['chatgpt-pro-20x',200,14000]]
 };
-let st=Object.assign({mode:'api',claude:'claude-max-20x',codex:'chatgpt-pro-20x'},
+let st=Object.assign({mode:'plan',claude:'claude-max-20x',codex:'chatgpt-pro-20x'},
  JSON.parse(localStorage.getItem('cc-pricing')||'{}'));
+// URL params override saved state (shareable links): ?mode=api|plan&claude=<plan>&codex=<plan>&expand=<n>
+const urlQ=new URLSearchParams(location.search);
+for(const k of ['mode','claude','codex']) if(urlQ.get(k)) st[k]=urlQ.get(k);
 const $=id=>document.getElementById(id);
 const fmt=n=>n.toLocaleString();
 const money=n=>n?'$'+n.toFixed(n<1?4:2):'<span class=dim>$0</span>';
@@ -511,6 +514,8 @@ initControls();
 fetch('/api').then(r=>r.json()).then(d=>{
  data=d.sessions.map(enrich);
  render();
+ const n=+urlQ.get('expand')||0;
+ document.querySelectorAll('#t > tbody > tr:nth-child(odd)').forEach((tr,i)=>{if(i<n)tr.click();});
 });
 </script></body></html>`;
 

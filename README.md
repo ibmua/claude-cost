@@ -4,15 +4,22 @@ A tiny, zero-dependency local dashboard that shows what every past **Claude Code
 
 It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`), prices the token usage per model at API list prices, and serves a single-page dashboard.
 
+![Plan mode](docs/plan-mode.png)
+
 ## Features
 
-- 🧾 **API pricing** — input / output / cache-write / cache-read priced per model (Opus, Sonnet, Haiku, Fable, GPT-5.x, …)
-- 📦 **Plan pricing** — switch to your subscription's effective rate. Pick your Anthropic plan (Pro / Max 5× / Max 20×) and OpenAI plan (Plus / Pro 5× / Pro 20×); every dollar figure is scaled by *plan price ÷ max possible monthly API spend*, so you see the plan-equivalent cost of your usage
+- 📦 **Plan pricing** (default) — see your subscription's effective rate. Pick your Anthropic plan (Pro / Max 5× / Max 20×) and OpenAI plan (Plus / Pro 5× / Pro 20×); every dollar figure is scaled by *plan price ÷ max possible monthly API spend*, so you see the plan-equivalent cost of your usage. Mode and plan choices are remembered (localStorage)
+- 🧾 **API pricing** — one click away: raw input / output / cache-write / cache-read priced per model (Opus, Sonnet, Haiku, Fable, GPT-5.x, …)
 - 🤖 Subagent/sidechain work is merged into its parent session and broken out as "subwork"
 - 📊 Per-session drill-down: per-model token counts, spend by category (input / output / cache write / cache read / main / subworkers)
 - 🔍 Live project filter — totals cards recompute over the filtered rows
 - ↕️ Sortable columns, duration, cache-hit share
 - ⚡ mtime-cached scanning, so multi-GB log directories stay fast after the first load
+- 🔗 Shareable URL params override the saved state: `?mode=api|plan&claude=<plan>&codex=<plan>&expand=<n>`
+
+| API mode | Session drill-down |
+|---|---|
+| ![API mode](docs/api-mode.png) | ![Session detail](docs/session-detail.png) |
 
 ## Run
 
