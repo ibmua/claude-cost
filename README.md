@@ -15,10 +15,11 @@ It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/
 - 📈 **Spend-over-time chart** in the drill-down — cumulative raw-API $ across the session, subagent turns included (hover for the $ at any moment)
 - ⚙️ **Workflow runs** (multi-agent orchestration under `subagents/workflows/`) fold into their mother session and show up as a `⚙ N workflow · 🤖×M` badge
 - 🎯 Accurate Claude accounting: one API response is logged as many jsonl lines (same `message.id`, identical cache tokens, growing `output_tokens`) — usage is deduped per message id, otherwise cache costs inflate ~2×
+- 🖥️ **Multi-machine** — optionally index other computers' session logs too: a gitignored `machines.local.mjs` declares extra log roots (e.g. rsync'd copies) and an optional background sync command; a 🌐 All / 💻 local / … header toggle switches between machines, and rows get a machine badge. All host names, paths, and sync scripts stay in the gitignored file
 - 🔍 Live project filter — totals cards recompute over the filtered rows
 - ↕️ Sortable columns, duration, cache-hit share
 - ⚡ mtime-cached scanning, so multi-GB log directories stay fast after the first load
-- 🔗 Shareable URL params override the saved state: `?mode=api|plan&claude=<plan>&codex=<plan>&expand=<n>`
+- 🔗 Shareable URL params override the saved state: `?mode=api|plan&claude=<plan>&codex=<plan>&machine=<id|all>&expand=<n>`
 
 | API mode | Session drill-down |
 |---|---|

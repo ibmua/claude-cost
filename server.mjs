@@ -9,10 +9,42 @@ import { readFileSync, readdirSync, statSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { execFile } from "node:child_process";
 
 const ROOT = join(homedir(), ".claude", "projects");
 const CODEX_ROOT = join(homedir(), ".codex", "sessions");
 const PORT = process.env.PORT || 8799;
+
+// === Machines =============================================================
+// Sessions are indexed per "machine". The local machine is built in; extra
+// machines come from an OPTIONAL, gitignored ./machines.local.mjs:
+//   export const machines = [
+//     { id: "name", label: "🖥 name",
+//       claudeRoot: "/abs/path/to/synced/claude/projects",
+//       codexRoot:  "/abs/path/to/synced/codex/sessions",
+//       syncCmd: "/abs/path/to/sync-script.sh",   // optional
+//       syncIntervalSec: 600 },                    // optional, default 600
+//   ];
+// `syncCmd` is kicked off in the background (fire-and-forget) at most once
+// per interval before scanning — e.g. an rsync wrapper that pulls another
+// computer's logs into a local cache dir. Host names, paths, and scripts all
+// live in the gitignored file, so the repo stays free of private details.
+const MACHINES = [{ id: "local", label: "💻 local", claudeRoot: ROOT, codexRoot: CODEX_ROOT }];
+try {
+  const ext = await import("./machines.local.mjs");
+  for (const m of ext.machines || []) if (m && m.id) MACHINES.push(m);
+} catch {}
+
+const _lastSync = new Map(); // machine id -> epoch ms when sync was last kicked
+function maybeSync(m) {
+  if (!m.syncCmd) return;
+  const iv = (m.syncIntervalSec || 600) * 1000;
+  if (Date.now() - (_lastSync.get(m.id) || 0) < iv) return;
+  _lastSync.set(m.id, Date.now());
+  execFile("sh", ["-c", m.syncCmd], { timeout: 900e3 }, (err) => {
+    if (err) console.error(`[sync ${m.id}] ${err.message}`);
+  });
+}
 
 // === OpenAI / Codex pricing ($ per 1M tokens) ===========================
 // Source checked 2026-06-11: https://openai.com/api/pricing/
@@ -354,8 +386,28 @@ async function cachedScan(file, fn) {
   return val;
 }
 
-async function collect() {
-  const claudeRaw = walk(ROOT).map((f) => { const s = scanSession(f); if (s) s.source = "claude"; return s; }).filter(Boolean);
+// cachedScan returns shared objects; clone before the subagent merge mutates them.
+const cloneRow = (r) => ({
+  ...r,
+  breakdown: (r.breakdown || []).map((b) => ({ ...b })),
+  lane: r.lane && { ...r.lane },
+  cat: r.cat && { ...r.cat },
+  series: r.series ? r.series.slice() : [],
+});
+
+async function collectMachine(machine) {
+  let claudeFiles = [];
+  try { claudeFiles = walk(machine.claudeRoot); } catch {}
+  const claudeRaw = [];
+  for (const f of claudeFiles) {
+    try {
+      const cached = await cachedScan(f, async (x) => scanSession(x));
+      if (!cached) continue;
+      const s = cloneRow(cached);
+      s.source = "claude";
+      claudeRaw.push(s);
+    } catch {}
+  }
   const claudeById = new Map(claudeRaw.filter((s) => !s.parentSessionId).map((s) => [s.id, s]));
   const claude = [];
   for (const s of claudeRaw) {
@@ -368,18 +420,10 @@ async function collect() {
     else claude.push(s);
   }
   let codexFiles = [];
-  try { codexFiles = walk(CODEX_ROOT); } catch {}
+  try { codexFiles = walk(machine.codexRoot); } catch {}
   const codex = [];
   const codexSubs = [];
   const codexByThread = new Map(); // main threadId -> session row
-  // cachedScan returns shared objects; clone before the merge below mutates them.
-  const cloneRow = (r) => ({
-    ...r,
-    breakdown: (r.breakdown || []).map((b) => ({ ...b })),
-    lane: r.lane && { ...r.lane },
-    cat: r.cat && { ...r.cat },
-    series: r.series ? r.series.slice() : [],
-  });
   for (const f of codexFiles) {
     try {
       const cachedRow = await cachedScan(f, scanCodex);
@@ -425,9 +469,19 @@ async function collect() {
   // Set → count (Sets don't serialize); mark sessions that ran Workflow tool(s).
   for (const s of sessions) {
     if (s._wf) { s.workflowCount = s._wf.size; delete s._wf; }
+    s.machine = machine.id;
   }
-  sessions.sort((a, b) => (b.last || "").localeCompare(a.last || ""));
   return sessions;
+}
+
+async function collect() {
+  const all = [];
+  for (const m of MACHINES) {
+    maybeSync(m);
+    all.push(...await collectMachine(m));
+  }
+  all.sort((a, b) => (b.last || "").localeCompare(a.last || ""));
+  return all;
 }
 
 const PAGE = `<!doctype html><html><head><meta charset=utf8>
@@ -478,6 +532,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  .warn{color:#f59e0b} .big{color:#f87171;font-weight:600}
  .cr{color:#fbbf24} td.cr{color:#fbbf24}
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
+ .pill.mach{background:#f59e0b1f;color:#fbbf24;border:1px solid #f59e0b44}
  tr.month td{background:#141927;color:#a8b0c2;font-size:12px;border-top:1px solid #2a3147;border-bottom:1px solid #2a3147;padding:9px 12px}
  tr.month b{color:#e6e6e6}
  details.prices{margin:0 24px 8px;background:#161a23;border:1px solid #262b38;border-radius:10px}
@@ -506,6 +561,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
    <button data-m=api>🧾 API</button>
    <button data-m=plan>📦 Plan</button>
   </div>
+  <div class=seg id=machSeg style="display:none" title="Which computer's sessions to show"></div>
   <label class=plansel title="Anthropic plan (plan price ÷ max possible monthly API spend)">🟠 <select id=selClaude></select></label>
   <label class=plansel title="OpenAI / ChatGPT plan (plan price ÷ max possible monthly API spend)">🟢 <select id=selCodex></select></label>
   <span class=mult id=multNote></span>
@@ -523,7 +579,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  <th data-k=sub>$ subwork</th><th data-k=usd>$ Total</th><th data-k=cacheshare>cache%</th>
 </tr></thead><tbody></tbody></table></div>
 <script>
-let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}};
+let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}}, machines=[];
 const MONEYK={din:1,dout:1,dcw:1,dcr:1,sub:1,usd:1};
 // [id, plan $/mo, max possible API-value spend $/mo] — effective rate = price/max
 // The max-spend figures are rough guesses and real usage can blow past them.
@@ -533,11 +589,11 @@ const PLANS={
  claude:[['claude-pro',20,400],['claude-max-5x',100,2000],['claude-max-20x',200,8000]],
  codex:[['chatgpt-plus',20,700],['chatgpt-pro-5x',100,3500],['chatgpt-pro-20x',200,14000]]
 };
-let st=Object.assign({mode:'plan',claude:'claude-max-20x',codex:'chatgpt-pro-20x'},
+let st=Object.assign({mode:'plan',claude:'claude-max-20x',codex:'chatgpt-pro-20x',machine:'all'},
  JSON.parse(localStorage.getItem('cc-pricing')||'{}'));
-// URL params override saved state (shareable links): ?mode=api|plan&claude=<plan>&codex=<plan>&expand=<n>
+// URL params override saved state (shareable links): ?mode=api|plan&claude=<plan>&codex=<plan>&machine=<id|all>&expand=<n>
 const urlQ=new URLSearchParams(location.search);
-for(const k of ['mode','claude','codex']) if(urlQ.get(k)) st[k]=urlQ.get(k);
+for(const k of ['mode','claude','codex','machine']) if(urlQ.get(k)) st[k]=urlQ.get(k);
 const $=id=>document.getElementById(id);
 const fmt=n=>n.toLocaleString();
 const money=n=>n?'$'+n.toFixed(n<1?4:2):'<span class=dim>$0</span>';
@@ -623,8 +679,10 @@ function subworkerModels(s){
  return ' <span class="pill sub" title="subworker models: '+title+'">sub '+shown+'</span>';
 }
 function visible(){
- if(!q) return data.slice();
- return data.filter(s=>displayName(s).toLowerCase().includes(q));
+ let rows=data;
+ if(st.machine!=='all') rows=rows.filter(s=>(s.machine||'local')===st.machine);
+ if(q) rows=rows.filter(s=>displayName(s).toLowerCase().includes(q));
+ return rows.slice();
 }
 function render(){
  computeCaps();
@@ -655,9 +713,11 @@ function render(){
   const f=fac(s);
   const tr=document.createElement('tr');tr.style.cursor='pointer';tr.className='s';
   const badge=s.source==='codex'?'<span class="pill cdx">codex</span> ':'<span class="pill cld">claude</span> ';
+  const machBadge=(machines.length>1&&st.machine==='all'&&(s.machine||'local')!=='local')
+    ?'<span class="pill mach" title="machine: '+s.machine+'">'+machLabel(s.machine)+'</span> ':'';
   tr.innerHTML=
    '<td class="l mono dim">'+when(s)+'</td>'+
-   '<td class="l proj mono">'+badge+displayName(s)+
+   '<td class="l proj mono">'+machBadge+badge+displayName(s)+
      ' <span class="sid" title="session id: '+(s.id||'')+'">#'+shortId(s)+'</span>'+
      modelSwitch(s)+subCount(s)+subworkerModels(s)+'</td>'+
    '<td>'+fmt(s.msgs)+'</td>'+
@@ -835,6 +895,19 @@ function syncControls(){
     '. Claude months are capped at the plan price ⛔ (prorated for the current month); Codex stays uncapped. Click a column to sort.'
   : '🧾 API list prices · Opus $5/$25 · Sonnet $3/$15 · Fable $10/$50 per Mtok · cache-read 0.1× · cache-write 1.25× · GPT-5.5 $5/$0.50/$30 · GPT-5.4 $2.50/$0.25/$15 (checked 2026-06-11). Click a column to sort.';
 }
+function machLabel(id){const m=machines.find(m=>m.id===id);return m?m.label:id;}
+function buildMachSeg(){
+ const seg=$('machSeg');
+ if(machines.length<2){seg.style.display='none';return;}
+ if(!machines.some(m=>m.id===st.machine)&&st.machine!=='all')st.machine='all';
+ seg.style.display='';
+ seg.innerHTML='<button data-m=all>🌐 All</button>'+
+  machines.map(m=>'<button data-m="'+m.id+'">'+m.label+'</button>').join('');
+ seg.querySelectorAll('button').forEach(b=>{
+  b.classList.toggle('on',b.dataset.m===st.machine);
+  b.onclick=()=>{st.machine=b.dataset.m;saveSt();buildMachSeg();render();};
+ });
+}
 function initControls(){
  for(const [src,sel] of [['claude','selClaude'],['codex','selCodex']]){
   $(sel).innerHTML=PLANS[src].map(p=>
@@ -854,6 +927,8 @@ function loadData(){
  fetch('/api').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
   data=d.sessions.map(enrich);
   if(d.prices)prices=d.prices;
+  machines=d.machines||[];
+  buildMachSeg();
   render();
   const n=+urlQ.get('expand')||0;
   document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
@@ -869,7 +944,11 @@ createServer(async (req, res) => {
   if (req.url === "/api") {
     const sessions = await collect();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, prices: { claude: PRICES, openai: OPENAI_PRICES } }));
+    res.end(JSON.stringify({
+      sessions,
+      machines: MACHINES.map(({ id, label }) => ({ id, label })),
+      prices: { claude: PRICES, openai: OPENAI_PRICES },
+    }));
   } else {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(PAGE);
