@@ -12,6 +12,9 @@ It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/
 - 🧾 **API pricing** — one click away: raw input / output / cache-write / cache-read priced per model (Opus, Sonnet, Haiku, Fable, GPT-5.x, …)
 - 🤖 Subagent/sidechain work is merged into its parent session and broken out as "subwork"
 - 📊 Per-session drill-down: per-model token counts, spend by category (input / output / cache write / cache read / main / subworkers)
+- 📈 **Spend-over-time chart** in the drill-down — cumulative raw-API $ across the session, subagent turns included (hover for the $ at any moment)
+- ⚙️ **Workflow runs** (multi-agent orchestration under `subagents/workflows/`) fold into their mother session and show up as a `⚙ N workflow · 🤖×M` badge
+- 🎯 Accurate Claude accounting: one API response is logged as many jsonl lines (same `message.id`, identical cache tokens, growing `output_tokens`) — usage is deduped per message id, otherwise cache costs inflate ~2×
 - 🔍 Live project filter — totals cards recompute over the filtered rows
 - ↕️ Sortable columns, duration, cache-hit share
 - ⚡ mtime-cached scanning, so multi-GB log directories stay fast after the first load

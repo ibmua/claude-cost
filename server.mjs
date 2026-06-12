@@ -82,12 +82,28 @@ function costOf(model, b) {
 function scanSession(file) {
   const cells = new Map(); // `${model}|${lane}` -> {in,out,cw,cr}
   const isSubagentFile = file.includes("/subagents/");
-  let cwd = null, first = null, last = null, msgs = 0;
+  // Parent session = the dir segment immediately above `subagents`. This is the
+  // same for a plain subagent (<sid>/subagents/agent.jsonl) AND for a Workflow
+  // agent nested deeper (<sid>/subagents/workflows/<wf>/agent.jsonl), so workflow
+  // sub-sessions fold into their mother session instead of listing standalone.
+  const parts0 = file.split("/");
+  const si = parts0.lastIndexOf("subagents");
+  const parentSessionId = isSubagentFile && si > 0 ? parts0[si - 1] : null;
+  // Workflow agents live at <sid>/subagents/workflows/<wf_id>/agent-*.jsonl —
+  // capture the workflow id so the parent can report distinct workflow runs.
+  const workflowId = (si >= 0 && parts0[si + 1] === "workflows") ? parts0[si + 2] : null;
+  let cwd = null, first = null, last = null;
   let subagentName = isSubagentFile
     ? file.split("/").pop().replace(".jsonl", "").replace(/^agent-/, "")
     : null;
   let text;
   try { text = readFileSync(file, "utf8"); } catch { return null; }
+  // One API response is logged as several jsonl lines (one per content block /
+  // streaming snapshot): input+cache tokens identical on each copy, output_tokens
+  // growing (1 -> final). Summing every line double-bills the cache tokens, so
+  // count each message.id once, keeping the copy with the largest output_tokens.
+  const byMsg = new Map(); // message id -> {model, lane, u}
+  let anon = 0;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let o; try { o = JSON.parse(line); } catch { continue; }
@@ -96,9 +112,25 @@ function scanSession(file) {
     if (o.timestamp) { first = first || o.timestamp; last = o.timestamp; }
     const u = o?.message?.usage;
     if (!u) continue;
-    msgs++;
     const model = o?.message?.model || "unknown";
     const lane = (o.isSidechain || isSubagentFile) ? "sub" : "main";
+    const id = o?.message?.id || o?.requestId || `anon-${anon++}`;
+    const prev = byMsg.get(id);
+    if (!prev || (u.output_tokens || 0) > (prev.u.output_tokens || 0)) {
+      byMsg.set(id, { model, lane, u, ts: o.timestamp || prev?.ts || last });
+    }
+  }
+  // per-message [epochMs, rawApiUsd] points for the cumulative-spend chart
+  const series = [];
+  for (const { model, u, ts } of byMsg.values()) {
+    const c = costOf(model, {
+      in: u.input_tokens || 0, out: u.output_tokens || 0,
+      cw: u.cache_creation_input_tokens || 0, cr: u.cache_read_input_tokens || 0,
+    });
+    if (c && ts) series.push([new Date(ts).getTime(), c]);
+  }
+  const msgs = byMsg.size;
+  for (const { model, lane, u } of byMsg.values()) {
     const k = `${model}|${lane}`;
     const b = cells.get(k) || { in: 0, out: 0, cw: 0, cr: 0 };
     b.in += u.input_tokens || 0;
@@ -152,9 +184,10 @@ function scanSession(file) {
     id: file.split("/").pop().replace(".jsonl", ""),
     cwd: displayCwd,
     mainModels,
-    first, last, msgs, usd, tokens, unpriced, breakdown, lane, cat,
+    first, last, msgs, usd, tokens, unpriced, breakdown, lane, cat, series,
     realCwd: cwd,
-    parentSessionId: isSubagentFile ? file.split("/").at(-3) : null,
+    parentSessionId,
+    workflowId,
     isSubagentFile,
   };
 }
@@ -172,6 +205,12 @@ function mergeClaudeSubagent(parent, sub) {
   parent.cat.cw += sub.cat.cw;
   parent.cat.cr += sub.cat.cr;
   parent.subagentCount = (parent.subagentCount || 0) + 1;
+  if (sub.workflowId) {
+    (parent._wf = parent._wf || new Set()).add(sub.workflowId);
+  }
+  if (sub.series && sub.series.length) {
+    parent.series = (parent.series || []).concat(sub.series);
+  }
 
   const byModel = new Map(parent.breakdown.map((b) => [b.model, { ...b }]));
   for (const b of sub.breakdown) {
@@ -208,6 +247,7 @@ async function scanCodex(file) {
   // (An earlier version skipped subagent files as "double-counted" — that was
   // wrong and undercounted Codex ~20x in subagent-heavy months.)
   const sum = { in: 0, cached: 0, out: 0 };
+  const turns = []; // {ts, in, cached, out} per turn, priced after model is known
   const num = (str, k) => { const m = str.match(new RegExp(`"${k}":(\\d+)`)); return m ? +m[1] : 0; };
   const rl = createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity });
   for await (const line of rl) {
@@ -239,9 +279,12 @@ async function scanCodex(file) {
       const ml = line.match(/"last_token_usage":\{([^}]*)\}/);
       if (ml) {
         msgs++;
-        sum.in += num(ml[1], "input_tokens");
-        sum.cached += num(ml[1], "cached_input_tokens");
-        sum.out += num(ml[1], "output_tokens");
+        const ti = num(ml[1], "input_tokens");
+        const tc = num(ml[1], "cached_input_tokens");
+        const to = num(ml[1], "output_tokens");
+        sum.in += ti; sum.cached += tc; sum.out += to;
+        const tt = line.match(/"timestamp":"([^"]+)"/);
+        turns.push({ ts: tt ? tt[1] : last, in: ti, cached: tc, out: to });
       }
     }
   }
@@ -270,6 +313,13 @@ async function scanCodex(file) {
     usd = cat.in + cat.cr + cat.out;
   } else unpriced = true;
   const tokens = inputTot + out;
+  // per-turn [epochMs, rawApiUsd] points for the cumulative-spend chart
+  const series = [];
+  if (p) for (const t of turns) {
+    const unc = Math.max(0, t.in - t.cached);
+    const c = (unc * p.in + t.cached * p.cached + t.out * p.out) / 1e6;
+    if (c && t.ts) series.push([new Date(t.ts).getTime(), c]);
+  }
   return {
     source: "codex",
     id: file.split("/").pop().replace("rollout-", "").replace(".jsonl", "").slice(0, 33),
@@ -277,7 +327,7 @@ async function scanCodex(file) {
     codexSubagentOf: isSub ? parentThreadId || "" : undefined,
     subName,
     cwd: "codex/" + (model || "?"),
-    first, last, msgs, usd, tokens, unpriced,
+    first, last, msgs, usd, tokens, unpriced, series,
     breakdown: [{
       model: model || "?",
       in: uncached,
@@ -328,6 +378,7 @@ async function collect() {
     breakdown: (r.breakdown || []).map((b) => ({ ...b })),
     lane: r.lane && { ...r.lane },
     cat: r.cat && { ...r.cat },
+    series: r.series ? r.series.slice() : [],
   });
   for (const f of codexFiles) {
     try {
@@ -371,6 +422,10 @@ async function collect() {
     }
   }
   const sessions = [...claude, ...codex].filter((s) => s && s.tokens > 0);
+  // Set → count (Sets don't serialize); mark sessions that ran Workflow tool(s).
+  for (const s of sessions) {
+    if (s._wf) { s.workflowCount = s._wf.size; delete s._wf; }
+  }
   sessions.sort((a, b) => (b.last || "").localeCompare(a.last || ""));
   return sessions;
 }
@@ -412,6 +467,14 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  td.l,th.l{text-align:left} tbody tr:hover{background:#171b25}
  .proj{color:#7dd3fc} .dim{color:#6b7280} .mono{font-family:ui-monospace,monospace;font-size:12px}
  .pill{display:inline-block;background:#1e2430;border-radius:6px;padding:1px 7px;margin:1px;font-size:11px}
+ .sid{color:#6b7280;font-size:11px;font-family:ui-monospace,monospace}
+ .pill.wf{background:#7c3aed26;color:#c4b5fd;border:1px solid #7c3aed66;font-weight:600}
+ .chartbox{position:relative;margin:10px 0 4px 8px;width:max-content}
+ .chartbox h4{margin:0 0 4px;font-size:12px;color:#a8b0c2;font-weight:600}
+ .chartbox svg{display:block;background:#11151d;border:1px solid #262b38;border-radius:8px}
+ .chartbox .axl{fill:#6b7280;font-size:10px;font-family:ui-monospace,monospace}
+ .charttip{position:absolute;pointer-events:none;background:#0b0d13;border:1px solid #3b4664;border-radius:6px;padding:4px 8px;font-size:11px;color:#e6e6e6;white-space:nowrap;transform:translate(-50%,-120%);opacity:0;transition:opacity .08s;z-index:5}
+ .charttip b{color:#34d399}
  .warn{color:#f59e0b} .big{color:#f87171;font-weight:600}
  .cr{color:#fbbf24} td.cr{color:#fbbf24}
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
@@ -463,6 +526,9 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
 let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}};
 const MONEYK={din:1,dout:1,dcw:1,dcr:1,sub:1,usd:1};
 // [id, plan $/mo, max possible API-value spend $/mo] — effective rate = price/max
+// The max-spend figures are rough guesses and real usage can blow past them.
+// Claude plan-mode dollars are additionally capped per month at the plan price
+// (prorated for the in-progress month). Codex is intentionally uncapped.
 const PLANS={
  claude:[['claude-pro',20,400],['claude-max-5x',100,2000],['claude-max-20x',200,8000]],
  codex:[['chatgpt-plus',20,700],['chatgpt-pro-5x',100,3500],['chatgpt-pro-20x',200,14000]]
@@ -477,7 +543,40 @@ const fmt=n=>n.toLocaleString();
 const money=n=>n?'$'+n.toFixed(n<1?4:2):'<span class=dim>$0</span>';
 function planOf(src){return PLANS[src].find(p=>p[0]===st[src])||PLANS[src][PLANS[src].length-1];}
 function ratio(src){if(st.mode!=='plan')return 1;const p=planOf(src);return p[1]/p[2];}
-function fac(s){return ratio(s.source==='codex'?'codex':'claude');}
+// Monthly cap: Claude plan-$ for a calendar month can't exceed the plan price
+// (prorated for the current month). capF['claude|2026-06']=0.15 means that
+// month blew past the cap and every session in it is scaled down by 0.15.
+let capF={};
+function srcOf(s){return s.source==='codex'?'codex':'claude';}
+function computeCaps(){
+ capF={};
+ if(st.mode!=='plan')return;
+ const sums=new Map(); // 'src|YYYY-MM' -> raw API value
+ for(const s of data){
+  const src=srcOf(s);
+  if(src==='codex')continue;
+  const k=src+'|'+(s.last||'').slice(0,7);
+  sums.set(k,(sums.get(k)||0)+s.usd);
+ }
+ const now=new Date(), curMk=now.toISOString().slice(0,7);
+ for(const [k,api] of sums){
+  const [src,mk]=k.split('|');
+  const p=planOf(src);
+  const raw=api*p[1]/p[2];
+  let frac=1;
+  if(mk===curMk){
+   const dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+   frac=Math.min(1,now.getDate()/dim);
+  }
+  const cap=p[1]*frac;
+  if(raw>cap)capF[k]=cap/raw;
+ }
+}
+function fac(s){
+ const src=srcOf(s), f=ratio(src);
+ if(st.mode!=='plan')return f;
+ return f*(capF[src+'|'+(s.last||'').slice(0,7)]||1);
+}
 function enrich(s){
  s.din=s.cat.in;s.dout=s.cat.out;s.dcw=s.cat.cw;s.dcr=s.cat.cr;
  s.sub=s.lane.sub;
@@ -486,7 +585,14 @@ function enrich(s){
  return s;
 }
 function durStr(m){if(!m)return '';if(m<60)return Math.round(m)+'m';return (m/60).toFixed(1)+'h';}
-function when(s){return (s.last||'').replace('T',' ').slice(0,16);}
+// Kyiv ("cave") time — DST-correct via Intl, formatted YYYY-MM-DD HH:MM
+const KYIV='Europe/Kyiv';
+const _kf=new Intl.DateTimeFormat('en-CA',{timeZone:KYIV,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
+function kyiv(iso){if(!iso)return '';const d=(typeof iso==='number')?new Date(iso):new Date(iso);if(isNaN(d))return '';
+ const p={};for(const x of _kf.formatToParts(d))p[x.type]=x.value;
+ return p.year+'-'+p.month+'-'+p.day+' '+p.hour+':'+p.minute;}
+function when(s){return kyiv(s.last);}
+function shortId(s){const id=s.id||'';const base=id.replace(/^agent-/,'');return base.slice(0,8);}
 function shortModel(model){return (model||'?').replace(/^claude-/,'');}
 function displayName(s){
  let name=(s.cwd||'').replace('/home/i','~');
@@ -499,8 +605,15 @@ function modelSwitch(s){
  return ' <span class=pill title="model switched mid-session: '+s.mainModels.map(shortModel).join(' → ')+'">🔀</span>';
 }
 function subCount(s){
- if(s.source!=='codex'||!s.subagentCount)return '';
- return ' <span class=pill title="spawned '+s.subagentCount+' subagent thread(s); their usage is merged into this session\\'s totals">🤖×'+s.subagentCount+'</span>';
+ const a=s.subagentCount||0, w=s.workflowCount||0;
+ if(!a&&!w)return '';
+ const ag='🤖×'+a;
+ if(w){
+  const t='⚙️ included '+w+' Workflow run'+(w>1?'s':'')+' that spawned '+a+' agent thread'+(a>1?'s':'')+' — all usage merged into this session';
+  return ' <span class="pill wf" title="'+t+'">⚙️ '+w+' workflow'+(w>1?'s':'')+' · '+ag+'</span>';
+ }
+ const t='spawned '+a+' subagent thread'+(a>1?'s':'')+' — usage merged into this session';
+ return ' <span class=pill title="'+t+'">'+ag+'</span>';
 }
 function subworkerModels(s){
  const models=[...new Set((s.breakdown||[]).filter(b=>(b.sub||0)>0).map(b=>shortModel(b.model)))];
@@ -514,6 +627,7 @@ function visible(){
  return data.filter(s=>displayName(s).toLowerCase().includes(q));
 }
 function render(){
+ computeCaps();
  const rows=visible();
  rows.sort((a,b)=>{let x,y;
   if(sortK==='when'){x=a.last||'';y=b.last||'';}
@@ -543,7 +657,9 @@ function render(){
   const badge=s.source==='codex'?'<span class="pill cdx">codex</span> ':'<span class="pill cld">claude</span> ';
   tr.innerHTML=
    '<td class="l mono dim">'+when(s)+'</td>'+
-   '<td class="l proj mono">'+badge+displayName(s)+modelSwitch(s)+subCount(s)+subworkerModels(s)+'</td>'+
+   '<td class="l proj mono">'+badge+displayName(s)+
+     ' <span class="sid" title="session id: '+(s.id||'')+'">#'+shortId(s)+'</span>'+
+     modelSwitch(s)+subCount(s)+subworkerModels(s)+'</td>'+
    '<td>'+fmt(s.msgs)+'</td>'+
    '<td class=dim>'+durStr(s.dur)+'</td>'+
    '<td>'+fmt(s.tokens)+'</td>'+
@@ -557,6 +673,7 @@ function render(){
   const det=document.createElement('tr');det.style.display='none';
   det.innerHTML='<td colspan=12 class=l><div class=detail></div></td>';
   det.querySelector('.detail').innerHTML=detailHTML(s,f);
+  wireChart(det.querySelector('.chartbox'),s,f);
   tr.onclick=()=>{det.style.display=det.style.display==='none'?'':'none';};
   tb.appendChild(tr);tb.appendChild(det);
  }
@@ -569,8 +686,15 @@ function monthRow(mk,g){
  const name=mk?new Date(mk+'-15T00:00:00').toLocaleString('en',{month:'long',year:'numeric'}):'(no date)';
  tr.innerHTML='<td colspan=12 class=l>📅 <b>'+name+'</b> · '+g.n+' sessions · <b>'+money(g.usd)+'</b>'+
   (st.mode==='plan'?' <span class=dim>(🧾 '+money(g.api)+' API value)</span>':'')+
-  ' · 🟠 '+money(g.cld)+' · 🟢 '+money(g.cdx)+' · '+fmt(g.tok)+' tok';
+  ' · 🟠 '+money(g.cld)+' · 🟢 '+money(g.cdx)+' · '+fmt(g.tok)+' tok'+capNote(mk);
  return tr;
+}
+function capNote(mk){
+ if(st.mode!=='plan')return '';
+ const hit=['claude'].filter(src=>capF[src+'|'+mk]!==undefined);
+ if(!hit.length)return '';
+ const parts=hit.map(src=>(src==='claude'?'🟠':'🟢')+'×'+capF[src+'|'+mk].toFixed(3));
+ return ' <span class=warn title="Claude API value × effective rate exceeded the plan price for this month — Claude plan-$ capped at the subscription cost (prorated for the current month); sessions scaled by the shown factor">⛔ capped '+parts.join(' ')+'</span>';
 }
 function detailHTML(s,f){
  const rows=s.breakdown.map(b=>
@@ -587,9 +711,60 @@ function detailHTML(s,f){
    '<span class="pill cr">cache read '+money(s.cat.cr*f)+'</span>'+
    '<span class=pill>main '+money(s.lane.main*f)+'</span>'+
    '<span class="pill sub">subworkers '+money(s.lane.sub*f)+'</span>'+planNote+'</div>';
- return '<div class=mono dim style="margin:4px 0">'+s.id+'</div>'+cat+
+ const spawn=(s.workflowCount||s.subagentCount)
+   ? '<div class=mono style="margin:3px 0;color:#c4b5fd">'+
+     (s.workflowCount?('⚙️ <b>'+s.workflowCount+'</b> Workflow run'+(s.workflowCount>1?'s':'')+' · '):'')+
+     '🤖 <b>'+(s.subagentCount||0)+'</b> agent thread'+((s.subagentCount||0)>1?'s':'')+' spawned'+
+     ' <span class=dim>(usage merged in)</span></div>'
+   : '';
+ return '<div class=mono dim style="margin:4px 0">'+s.id+'</div>'+spawn+cat+
+  '<div class=chartbox></div>'+
   '<table class=inner><thead><tr><th class=l>model</th><th>input</th><th>output</th>'+
   '<th>cache write</th><th>cache read</th><th>$</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+// Cumulative-spend line chart with hover tooltip ($ spent by Kyiv time).
+function wireChart(box,s,f){
+ if(!box)return;
+ const pts=(s.series||[]).slice().sort((a,b)=>a[0]-b[0]);
+ if(pts.length<2){box.innerHTML='<h4>💵 Spend over time</h4>'+
+  '<div class=dim style="font-size:11px">not enough per-message timing data</div>';return;}
+ let acc=0;const cum=pts.map(([t,u])=>{acc+=u*f;return [t,acc];});
+ const total=acc||1, t0=cum[0][0], t1=cum[cum.length-1][0]>t0?cum[cum.length-1][0]:t0+1;
+ const W=560,H=150,padL=10,padR=10,padT=10,padB=20,iw=W-padL-padR,ih=H-padT-padB;
+ const X=t=>padL+(t-t0)/(t1-t0)*iw, Y=v=>padT+ih-(v/total)*ih;
+ let d='M';for(const [t,v] of cum)d+=' '+X(t).toFixed(1)+','+Y(v).toFixed(1)+' L';
+ d=d.replace(/ L$/,'');
+ const area=d+' L'+X(t1).toFixed(1)+','+(padT+ih)+' L'+X(t0).toFixed(1)+','+(padT+ih)+' Z';
+ box.innerHTML='<h4>💵 Spend over time — total '+money(total)+
+   ' <span class=dim style="font-weight:400">(hover for $ at a time)</span></h4>'+
+  '<svg width='+W+' height='+H+'>'+
+   '<path d="'+area+'" fill="#34d39914"/>'+
+   '<path d="'+d+'" fill="none" stroke="#34d399" stroke-width="1.6"/>'+
+   '<line class=guide x1=0 y1='+padT+' x2=0 y2='+(padT+ih)+' stroke="#7dd3fc" stroke-width=1 opacity=0/>'+
+   '<circle class=dot r=3.2 fill="#7dd3fc" stroke="#0b0d13" opacity=0/>'+
+   '<text class=axl x='+X(t0).toFixed(1)+' y='+(H-6)+' text-anchor=start>'+kyiv(t0)+'</text>'+
+   '<text class=axl x='+X(t1).toFixed(1)+' y='+(H-6)+' text-anchor=end>'+kyiv(t1)+'</text>'+
+   '<rect class=hit x=0 y=0 width='+W+' height='+H+' fill=transparent/>'+
+  '</svg><div class=charttip></div>';
+ const svg=box.querySelector('svg'),guide=box.querySelector('.guide'),
+   dot=box.querySelector('.dot'),tip=box.querySelector('.charttip'),hit=box.querySelector('.hit');
+ hit.onmousemove=e=>{
+  const r=svg.getBoundingClientRect();
+  const frac=Math.max(0,Math.min(1,(e.clientX-r.left-padL)/iw)), tt=t0+frac*(t1-t0);
+  let lo=0,hi=cum.length-1;while(lo<hi){const mid=(lo+hi)>>1;if(cum[mid][0]<tt)lo=mid+1;else hi=mid;}
+  if(lo>0&&Math.abs(cum[lo-1][0]-tt)<Math.abs(cum[lo][0]-tt))lo--;
+  const cx=X(cum[lo][0]),cy=Y(cum[lo][1]);
+  guide.setAttribute('x1',cx);guide.setAttribute('x2',cx);guide.setAttribute('opacity',0.5);
+  dot.setAttribute('cx',cx);dot.setAttribute('cy',cy);dot.setAttribute('opacity',1);
+  tip.innerHTML='<b>'+money(cum[lo][1])+'</b> · '+kyiv(cum[lo][0]);
+  // SVG has no offsetLeft/offsetTop — derive the svg's offset within the box from
+  // bounding rects, then clamp the center-anchored tooltip to the chart edges.
+  const br=box.getBoundingClientRect(),sr2=svg.getBoundingClientRect();
+  const ox=sr2.left-br.left,oy=sr2.top-br.top,half=(tip.offsetWidth||120)/2+2;
+  tip.style.left=Math.max(ox+half,Math.min(ox+cx,ox+W-half))+'px';
+  tip.style.top=(oy+cy)+'px';tip.style.opacity=1;
+ };
+ hit.onmouseleave=()=>{guide.setAttribute('opacity',0);dot.setAttribute('opacity',0);tip.style.opacity=0;};
 }
 function card(n,l,x){return '<div class=card><div class=n>'+n+'</div><div class=l>'+l+'</div>'+(x?'<div class=x>'+x+'</div>':'')+'</div>';}
 function renderTotals(rows){
@@ -656,7 +831,8 @@ function syncControls(){
  $('subNote').innerHTML=st.mode==='plan'
   ? '📦 Plan mode: every $ = API list cost × (plan price ÷ max possible monthly API spend). '+
     planOf('claude')[0]+' $'+planOf('claude')[1]+'/mo ÷ $'+fmt(planOf('claude')[2])+' · '+
-    planOf('codex')[0]+' $'+planOf('codex')[1]+'/mo ÷ $'+fmt(planOf('codex')[2])+'. Click a column to sort.'
+    planOf('codex')[0]+' $'+planOf('codex')[1]+'/mo ÷ $'+fmt(planOf('codex')[2])+
+    '. Claude months are capped at the plan price ⛔ (prorated for the current month); Codex stays uncapped. Click a column to sort.'
   : '🧾 API list prices · Opus $5/$25 · Sonnet $3/$15 · Fable $10/$50 per Mtok · cache-read 0.1× · cache-write 1.25× · GPT-5.5 $5/$0.50/$30 · GPT-5.4 $2.50/$0.25/$15 (checked 2026-06-11). Click a column to sort.';
 }
 function initControls(){
