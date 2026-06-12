@@ -536,6 +536,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  .cr{color:#fbbf24} td.cr{color:#fbbf24}
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
  .pill.mach{background:#f59e0b1f;color:#fbbf24;border:1px solid #f59e0b44}
+ .warm{cursor:help}
  tr.month td{background:#141927;color:#a8b0c2;font-size:12px;border-top:1px solid #2a3147;border-bottom:1px solid #2a3147;padding:9px 12px}
  tr.month b{color:#e6e6e6}
  details.prices{margin:0 24px 8px;background:#161a23;border:1px solid #262b38;border-radius:10px}
@@ -645,6 +646,33 @@ function enrich(s){
  return s;
 }
 function durStr(m){if(!m)return '';if(m<60)return Math.round(m)+'m';return (m/60).toFixed(1)+'h';}
+// Cache warmth: can a resumed session still hit the provider's prompt cache?
+// Anthropic: ~5-min TTL, refreshed on every request — predictable.
+// OpenAI: prefixes live ~5–60 min, evicted unpredictably — a guess at best.
+const fmtAge=m=>m<1?'<1 min':Math.round(m)+' min';
+function warmInfo(last,src){
+ if(!last)return null;
+ const age=(Date.now()-new Date(last))/6e4; // minutes since last activity
+ if(age<0)return null;
+ if(src==='claude'){
+  if(age<5)return ['♨️','Prompt cache warm — last activity '+fmtAge(age)+' ago. Anthropic keeps the cache ~5 minutes from last use (refreshed on every request), so resuming this session now will reuse the cached context. Claude cache lifetime is predictable.'];
+ }else{
+  if(age<5)return ['♨️','Prompt cache probably warm — last activity '+fmtAge(age)+' ago. OpenAI caches prompt prefixes for roughly 5–60 minutes, but eviction is unpredictable — treat this as a good guess, not a guarantee (unlike Claude\\'s firm ~5-minute TTL).'];
+  if(age<60)return ['🌡️','Prompt cache may still be warm — last activity '+fmtAge(age)+' ago. OpenAI prompt caches can survive up to ~1 hour, but eviction is unpredictable (unlike Claude\\'s firm ~5-minute TTL), so don\\'t depend on it.'];
+ }
+ return null;
+}
+function warmSpan(s){
+ return '<span class=warm data-last="'+(s.last||'')+'" data-src="'+srcOf(s)+'"></span>';
+}
+function updateWarmth(){
+ document.querySelectorAll('span.warm').forEach(el=>{
+  const w=warmInfo(el.dataset.last,el.dataset.src);
+  if(w){el.textContent=w[0];el.title=w[1];}
+  else if(el.textContent){el.textContent='';el.title='';}
+ });
+}
+setInterval(updateWarmth,30e3);
 // Browser's local time zone (override with ?tz=Area/City) — DST-correct via
 // Intl, formatted YYYY-MM-DD HH:MM
 const TZ=urlQ.get('tz')||Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -721,7 +749,7 @@ function render(){
   const machBadge=(machines.length>1&&st.machine==='all'&&(s.machine||'local')!=='local')
     ?'<span class="pill mach" title="machine: '+s.machine+'">'+machLabel(s.machine)+'</span> ':'';
   tr.innerHTML=
-   '<td class="l mono dim">'+when(s)+'</td>'+
+   '<td class="l mono dim">'+when(s)+' '+warmSpan(s)+'</td>'+
    '<td class="l proj mono">'+machBadge+badge+displayName(s)+
      ' <span class="sid" title="session id: '+(s.id||'')+'">#'+shortId(s)+'</span>'+
      modelSwitch(s)+subCount(s)+subworkerModels(s)+'</td>'+
@@ -745,6 +773,7 @@ function render(){
  renderTotals(rows);
  renderPrices();
  markSort();
+ updateWarmth();
 }
 function monthRow(mk,g){
  const tr=document.createElement('tr');tr.className='month';

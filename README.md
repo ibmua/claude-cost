@@ -16,6 +16,7 @@ It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/
 - ⚙️ **Workflow runs** (multi-agent orchestration under `subagents/workflows/`) fold into their mother session and show up as a `⚙ N workflow · 🤖×M` badge
 - 🎯 Accurate Claude accounting: one API response is logged as many jsonl lines (same `message.id`, identical cache tokens, growing `output_tokens`) — usage is deduped per message id, otherwise cache costs inflate ~2×
 - 🖥️ **Multi-machine** — optionally index other computers' session logs too: a gitignored `machines.local.mjs` declares extra log roots (e.g. rsync'd copies) and an optional background sync command; a 🌐 All / 💻 local / … header toggle switches between machines, and rows get a machine badge. All host names, paths, and sync scripts stay in the gitignored file
+- ♨️ **Cache-warmth indicator** — sessions whose prompt cache is likely still alive get a ♨️ next to their timestamp (hover for details), so you know when resuming a session will reuse cached context. Anthropic's ~5-minute, refreshed-on-use TTL makes this predictable for Claude; OpenAI prefixes can survive 5–60 minutes but are evicted unpredictably, so Codex sessions get a best-guess ♨️/🌡️ instead of a promise. Updates live every 30 s
 - 🔍 Live project filter — totals cards recompute over the filtered rows
 - ↕️ Sortable columns, duration, cache-hit share
 - ⚡ mtime-cached scanning, so multi-GB log directories stay fast after the first load
