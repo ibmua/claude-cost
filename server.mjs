@@ -41,7 +41,8 @@ function maybeSync(m) {
   const iv = (m.syncIntervalSec || 600) * 1000;
   if (Date.now() - (_lastSync.get(m.id) || 0) < iv) return;
   _lastSync.set(m.id, Date.now());
-  execFile("sh", ["-c", m.syncCmd], { timeout: 900e3 }, (err) => {
+  const [shell, flag] = process.platform === "win32" ? ["cmd", "/c"] : ["sh", "-c"];
+  execFile(shell, [flag, m.syncCmd], { timeout: 900e3 }, (err) => {
     if (err) console.error(`[sync ${m.id}] ${err.message}`);
   });
 }
@@ -91,10 +92,12 @@ const PRICES = {
   sonnet:              { in: 3, out: 15, cw: 3.75, cr: 0.3 },
 };
 
+// Paths are normalized to forward slashes so the "/subagents/"-style parsing
+// below works on Windows too (node's fs APIs accept / on every platform).
 function walk(dir) {
   const out = [];
   for (const name of readdirSync(dir)) {
-    const p = join(dir, name);
+    const p = join(dir, name).replaceAll("\\", "/");
     const s = statSync(p);
     if (s.isDirectory()) out.push(...walk(p));
     else if (name.endsWith(".jsonl")) out.push(p);
@@ -579,6 +582,7 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  <th data-k=sub>$ subwork</th><th data-k=usd>$ Total</th><th data-k=cacheshare>cache%</th>
 </tr></thead><tbody></tbody></table></div>
 <script>
+const HOME=${JSON.stringify(homedir().replaceAll("\\", "/"))};
 let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}}, machines=[];
 const MONEYK={din:1,dout:1,dcw:1,dcr:1,sub:1,usd:1};
 // [id, plan $/mo, max possible API-value spend $/mo] — effective rate = price/max
@@ -641,17 +645,18 @@ function enrich(s){
  return s;
 }
 function durStr(m){if(!m)return '';if(m<60)return Math.round(m)+'m';return (m/60).toFixed(1)+'h';}
-// Kyiv ("cave") time — DST-correct via Intl, formatted YYYY-MM-DD HH:MM
-const KYIV='Europe/Kyiv';
-const _kf=new Intl.DateTimeFormat('en-CA',{timeZone:KYIV,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
-function kyiv(iso){if(!iso)return '';const d=(typeof iso==='number')?new Date(iso):new Date(iso);if(isNaN(d))return '';
+// Browser's local time zone (override with ?tz=Area/City) — DST-correct via
+// Intl, formatted YYYY-MM-DD HH:MM
+const TZ=urlQ.get('tz')||Intl.DateTimeFormat().resolvedOptions().timeZone;
+const _kf=new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
+function tzfmt(iso){if(!iso)return '';const d=(typeof iso==='number')?new Date(iso):new Date(iso);if(isNaN(d))return '';
  const p={};for(const x of _kf.formatToParts(d))p[x.type]=x.value;
  return p.year+'-'+p.month+'-'+p.day+' '+p.hour+':'+p.minute;}
-function when(s){return kyiv(s.last);}
+function when(s){return tzfmt(s.last);}
 function shortId(s){const id=s.id||'';const base=id.replace(/^agent-/,'');return base.slice(0,8);}
 function shortModel(model){return (model||'?').replace(/^claude-/,'');}
 function displayName(s){
- let name=(s.cwd||'').replace('/home/i','~');
+ let name=(s.cwd||'').replaceAll('\\\\','/').replace(HOME,'~');
  if(s.source==='codex') name=name.replace(/^codex\\//,'');
  if(s.source==='claude') name=name.replace(/^claude-/,'');
  return name;
@@ -782,7 +787,7 @@ function detailHTML(s,f){
   '<table class=inner><thead><tr><th class=l>model</th><th>input</th><th>output</th>'+
   '<th>cache write</th><th>cache read</th><th>$</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
-// Cumulative-spend line chart with hover tooltip ($ spent by Kyiv time).
+// Cumulative-spend line chart with hover tooltip ($ spent by local time).
 function wireChart(box,s,f){
  if(!box)return;
  const pts=(s.series||[]).slice().sort((a,b)=>a[0]-b[0]);
@@ -802,8 +807,8 @@ function wireChart(box,s,f){
    '<path d="'+d+'" fill="none" stroke="#34d399" stroke-width="1.6"/>'+
    '<line class=guide x1=0 y1='+padT+' x2=0 y2='+(padT+ih)+' stroke="#7dd3fc" stroke-width=1 opacity=0/>'+
    '<circle class=dot r=3.2 fill="#7dd3fc" stroke="#0b0d13" opacity=0/>'+
-   '<text class=axl x='+X(t0).toFixed(1)+' y='+(H-6)+' text-anchor=start>'+kyiv(t0)+'</text>'+
-   '<text class=axl x='+X(t1).toFixed(1)+' y='+(H-6)+' text-anchor=end>'+kyiv(t1)+'</text>'+
+   '<text class=axl x='+X(t0).toFixed(1)+' y='+(H-6)+' text-anchor=start>'+tzfmt(t0)+'</text>'+
+   '<text class=axl x='+X(t1).toFixed(1)+' y='+(H-6)+' text-anchor=end>'+tzfmt(t1)+'</text>'+
    '<rect class=hit x=0 y=0 width='+W+' height='+H+' fill=transparent/>'+
   '</svg><div class=charttip></div>';
  const svg=box.querySelector('svg'),guide=box.querySelector('.guide'),
@@ -816,7 +821,7 @@ function wireChart(box,s,f){
   const cx=X(cum[lo][0]),cy=Y(cum[lo][1]);
   guide.setAttribute('x1',cx);guide.setAttribute('x2',cx);guide.setAttribute('opacity',0.5);
   dot.setAttribute('cx',cx);dot.setAttribute('cy',cy);dot.setAttribute('opacity',1);
-  tip.innerHTML='<b>'+money(cum[lo][1])+'</b> · '+kyiv(cum[lo][0]);
+  tip.innerHTML='<b>'+money(cum[lo][1])+'</b> · '+tzfmt(cum[lo][0]);
   // SVG has no offsetLeft/offsetTop — derive the svg's offset within the box from
   // bounding rects, then clamp the center-anchored tooltip to the chart edges.
   const br=box.getBoundingClientRect(),sr2=svg.getBoundingClientRect();

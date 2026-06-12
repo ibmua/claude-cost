@@ -27,14 +27,22 @@ It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/
 
 ## Run
 
+Works on Linux, macOS, and Windows — logs are read from `~/.claude/projects` and `~/.codex/sessions` under your home directory (`%USERPROFILE%` on Windows), which is where Claude Code and Codex put them on every OS. Timestamps render in your browser's time zone (`?tz=Area/City` to override).
+
 ```sh
 node server.mjs            # → http://localhost:8799
-PORT=9000 node server.mjs
+PORT=9000 node server.mjs  # bash/zsh
+```
+
+```powershell
+$env:PORT=9000; node server.mjs   # Windows PowerShell
 ```
 
 No dependencies, no build step — one file, Node ≥ 18.
 
-### Autostart (systemd user service)
+### Autostart
+
+**Linux (systemd user service):**
 
 ```ini
 # ~/.config/systemd/user/claude-cost.service
@@ -42,7 +50,7 @@ No dependencies, no build step — one file, Node ≥ 18.
 Description=claude-cost dashboard
 
 [Service]
-ExecStart=/usr/bin/node %h/CODE/claude-cost/server.mjs
+ExecStart=/usr/bin/node %h/claude-cost/server.mjs
 Restart=on-failure
 
 [Install]
@@ -52,6 +60,24 @@ WantedBy=default.target
 ```sh
 systemctl --user enable --now claude-cost.service
 ```
+
+**macOS (launchd):** save as `~/Library/LaunchAgents/com.claude-cost.plist`, then `launchctl load` it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.claude-cost</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/YOU/claude-cost/server.mjs</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+```
+
+**Windows:** Task Scheduler → "At log on" → `node C:\path\to\claude-cost\server.mjs`, or any process manager you already use (e.g. `pm2 start server.mjs`).
 
 ## Plan-mode math
 
