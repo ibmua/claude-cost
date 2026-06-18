@@ -7,7 +7,7 @@
 import { createServer } from "node:http";
 import { readFileSync, readdirSync, statSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { join } from "node:path";
+import { join, resolve, dirname, sep } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 
@@ -217,6 +217,7 @@ function scanSession(file) {
     : `${chainLabel} ${cwd || "(unknown)"}`;
   return {
     id: file.split("/").pop().replace(".jsonl", ""),
+    file,
     cwd: displayCwd,
     mainModels,
     first, last, msgs, usd, tokens, unpriced, breakdown, lane, cat, series,
@@ -358,6 +359,7 @@ async function scanCodex(file) {
   return {
     source: "codex",
     id: file.split("/").pop().replace("rollout-", "").replace(".jsonl", "").slice(0, 33),
+    file,
     threadId,
     codexSubagentOf: isSub ? parentThreadId || "" : undefined,
     subName,
@@ -490,6 +492,7 @@ async function collect() {
 const PAGE = `<!doctype html><html><head><meta charset=utf8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>💸 Claude Code session costs</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2334d399'><circle cx='12' cy='12' r='10' stroke='%2334d399' stroke-width='2' fill='none'/><circle cx='12' cy='12' r='4' fill='%2334d399'/><path d='M12 2v4M12 18v4M2 12h4m10 0h4' stroke='%2334d399' stroke-width='2'/></svg>">
 <style>
  body{font:14px/1.5 system-ui,sans-serif;margin:0;background:#0f1117;color:#e6e6e6}
  header{padding:14px 24px 12px;background:#161a23;border-bottom:1px solid #262b38}
@@ -536,7 +539,8 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  .cr{color:#fbbf24} td.cr{color:#fbbf24}
  .pill.cdx{background:#10b98122;color:#34d399} .pill.cld{background:#6366f122;color:#a5b4fc}
  .pill.mach{background:#f59e0b1f;color:#fbbf24;border:1px solid #f59e0b44}
- .warm{cursor:help}
+ .warm{cursor:help;display:inline-block;min-width:4.8em;margin-left:4px;color:#fbbf24;text-align:left}
+ .warm:empty{display:none}
  tr.month td{background:#141927;color:#a8b0c2;font-size:12px;border-top:1px solid #2a3147;border-bottom:1px solid #2a3147;padding:9px 12px}
  tr.month b{color:#e6e6e6}
  details.prices{margin:0 24px 8px;background:#161a23;border:1px solid #262b38;border-radius:10px}
@@ -553,6 +557,11 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
  table.price td.l{color:#7dd3fc;font-family:ui-monospace,monospace}
  table.price .raw{color:#5b6373;font-size:10px}
  .detail{padding:8px 0 14px}
+ .openbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:2px 0 8px}
+ .obtn{background:#1e2430;border:1px solid #2c3342;color:#cdd3e0;border-radius:7px;padding:4px 9px;font-size:12px;cursor:pointer}
+ .obtn:hover{background:#262d3b;border-color:#3a4356}
+ .opath{font-size:11px;color:#8b93a7;background:#11151d;border:1px solid #20242f;border-radius:6px;padding:2px 7px;max-width:100%;overflow-wrap:anywhere;word-break:break-all}
+ .ostat{font-size:11px;font-weight:600}
  table.inner{width:auto;margin:2px 0 2px 8px;border:1px solid #262b38;border-radius:8px;overflow:hidden}
  table.inner th,table.inner td{border-bottom:1px solid #20242f;padding:5px 14px;font-size:12px}
  table.inner th{position:static;background:#11151d}
@@ -585,6 +594,8 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
 <script>
 const HOME=${JSON.stringify(homedir().replaceAll("\\", "/"))};
 let data=[], sortK='when', desc=true, q='', prices={claude:{},openai:{}}, machines=[];
+let loadingData=false, firstLoad=true;
+const expanded=new Set();
 const MONEYK={din:1,dout:1,dcw:1,dcr:1,sub:1,usd:1};
 // [id, plan $/mo, max possible API-value spend $/mo] — effective rate = price/max
 // The max-spend figures are rough guesses and real usage can blow past them.
@@ -648,17 +659,28 @@ function enrich(s){
 function durStr(m){if(!m)return '';if(m<60)return Math.round(m)+'m';return (m/60).toFixed(1)+'h';}
 // Cache warmth: can a resumed session still hit the provider's prompt cache?
 // Anthropic: ~5-min TTL, refreshed on every request — predictable.
-// OpenAI: prefixes live ~5–60 min, evicted unpredictably — a guess at best.
+// OpenAI: prefixes may live longer, but eviction is unpredictable. Only show a
+// visible countdown for the likely first 5 minutes; do not present the possible
+// 60-minute tail as "hot cache" time.
 const fmtAge=m=>m<1?'<1 min':Math.round(m)+' min';
+function fmtCountdown(ms){
+ const s=Math.max(0,Math.ceil(ms/1000));
+ const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+ return h ? h+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0')
+          : m+':'+String(sec).padStart(2,'0');
+}
 function warmInfo(last,src){
  if(!last)return null;
- const age=(Date.now()-new Date(last))/6e4; // minutes since last activity
+ const t=new Date(last).getTime();
+ const now=Date.now();
+ const age=(now-t)/6e4; // minutes since last activity
  if(age<0)return null;
  if(src==='claude'){
-  if(age<5)return ['♨️','Prompt cache warm — last activity '+fmtAge(age)+' ago. Anthropic keeps the cache ~5 minutes from last use (refreshed on every request), so resuming this session now will reuse the cached context. Claude cache lifetime is predictable.'];
+  const remaining=t+5*60e3-now;
+  if(remaining>0)return ['♨️ '+fmtCountdown(remaining),'Prompt cache warm for about '+fmtCountdown(remaining)+' more — last activity '+fmtAge(age)+' ago. Anthropic keeps the cache ~5 minutes from last use (refreshed on every request), so resuming this session now will reuse the cached context. Claude cache lifetime is predictable.'];
  }else{
-  if(age<5)return ['♨️','Prompt cache probably warm — last activity '+fmtAge(age)+' ago. OpenAI caches prompt prefixes for roughly 5–60 minutes, but eviction is unpredictable — treat this as a good guess, not a guarantee (unlike Claude\\'s firm ~5-minute TTL).'];
-  if(age<60)return ['🌡️','Prompt cache may still be warm — last activity '+fmtAge(age)+' ago. OpenAI prompt caches can survive up to ~1 hour, but eviction is unpredictable (unlike Claude\\'s firm ~5-minute TTL), so don\\'t depend on it.'];
+  const likely=t+5*60e3-now;
+  if(likely>0)return ['♨️ '+fmtCountdown(likely),'Prompt cache probably warm for about '+fmtCountdown(likely)+' more — last activity '+fmtAge(age)+' ago. OpenAI caches prompt prefixes for roughly 5–60 minutes, but eviction is unpredictable — treat this as a good guess, not a guarantee (unlike Claude\\'s firm ~5-minute TTL).'];
  }
  return null;
 }
@@ -672,7 +694,7 @@ function updateWarmth(){
   else if(el.textContent){el.textContent='';el.title='';}
  });
 }
-setInterval(updateWarmth,30e3);
+setInterval(updateWarmth,1e3);
 // Browser's local time zone (override with ?tz=Area/City) — DST-correct via
 // Intl, formatted YYYY-MM-DD HH:MM
 const TZ=urlQ.get('tz')||Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -682,6 +704,7 @@ function tzfmt(iso){if(!iso)return '';const d=(typeof iso==='number')?new Date(i
  return p.year+'-'+p.month+'-'+p.day+' '+p.hour+':'+p.minute;}
 function when(s){return tzfmt(s.last);}
 function shortId(s){const id=s.id||'';const base=id.replace(/^agent-/,'');return base.slice(0,8);}
+function esc(t){return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function shortModel(model){return (model||'?').replace(/^claude-/,'');}
 function displayName(s){
  let name=(s.cwd||'').replaceAll('\\\\','/').replace(HOME,'~');
@@ -711,13 +734,30 @@ function subworkerModels(s){
  const shown=models.slice(0,3).join(', ')+(models.length>3?' +'+(models.length-3):'');
  return ' <span class="pill sub" title="subworker models: '+title+'">sub '+shown+'</span>';
 }
+function sessionKey(s){return [(s.machine||'local'),(s.source||'claude'),(s.id||s.file||'')].join('|');}
+function captureViewportAnchor(){
+ const rows=[...document.querySelectorAll('#t > tbody > tr.s')];
+ for(const tr of rows){
+  const r=tr.getBoundingClientRect();
+  if(r.bottom>0)return {key:tr.dataset.key,dy:r.top};
+ }
+ return null;
+}
+function restoreViewportAnchor(anchor){
+ if(!anchor||!anchor.key)return;
+ const tr=document.querySelector('#t > tbody > tr.s[data-key="'+CSS.escape(anchor.key)+'"]');
+ if(!tr)return;
+ const dy=tr.getBoundingClientRect().top-anchor.dy;
+ if(dy)scrollBy(0,dy);
+}
 function visible(){
  let rows=data;
  if(st.machine!=='all') rows=rows.filter(s=>(s.machine||'local')===st.machine);
  if(q) rows=rows.filter(s=>displayName(s).toLowerCase().includes(q));
  return rows.slice();
 }
-function render(){
+function render(opts={}){
+ const anchor=opts.preserveViewport?captureViewportAnchor():null;
  computeCaps();
  const rows=visible();
  rows.sort((a,b)=>{let x,y;
@@ -742,9 +782,11 @@ function render(){
   if(sortK==='when'){
    const mk=(s.last||'').slice(0,7);
    if(mk!==curMonth){curMonth=mk;tb.appendChild(monthRow(mk,byMonth.get(mk)));}
-  }
+ }
   const f=fac(s);
+  const key=sessionKey(s);
   const tr=document.createElement('tr');tr.style.cursor='pointer';tr.className='s';
+  tr.dataset.key=key;
   const badge=s.source==='codex'?'<span class="pill cdx">codex</span> ':'<span class="pill cld">claude</span> ';
   const machBadge=(machines.length>1&&st.machine==='all'&&(s.machine||'local')!=='local')
     ?'<span class="pill mach" title="machine: '+s.machine+'">'+machLabel(s.machine)+'</span> ':'';
@@ -763,17 +805,23 @@ function render(){
    '<td class=sub>'+money(s.sub*f)+'</td>'+
    '<td class="'+(s.usd*f>bigCut?'big':'')+'">'+money(s.usd*f)+(s.unpriced?' <span class=warn>?</span>':'')+'</td>'+
    '<td class=dim>'+s.cacheshare.toFixed(0)+'%</td>';
-  const det=document.createElement('tr');det.style.display='none';
+  const det=document.createElement('tr');det.dataset.key=key;det.style.display=expanded.has(key)?'':'none';
   det.innerHTML='<td colspan=12 class=l><div class=detail></div></td>';
   det.querySelector('.detail').innerHTML=detailHTML(s,f);
   wireChart(det.querySelector('.chartbox'),s,f);
-  tr.onclick=()=>{det.style.display=det.style.display==='none'?'':'none';};
+  wireOpen(det,s);
+  tr.onclick=()=>{
+   const open=det.style.display==='none';
+   det.style.display=open?'':'none';
+   if(open)expanded.add(key);else expanded.delete(key);
+  };
   tb.appendChild(tr);tb.appendChild(det);
  }
  renderTotals(rows);
  renderPrices();
  markSort();
  updateWarmth();
+ restoreViewportAnchor(anchor);
 }
 function monthRow(mk,g){
  const tr=document.createElement('tr');tr.className='month';
@@ -811,10 +859,38 @@ function detailHTML(s,f){
      '🤖 <b>'+(s.subagentCount||0)+'</b> agent thread'+((s.subagentCount||0)>1?'s':'')+' spawned'+
      ' <span class=dim>(usage merged in)</span></div>'
    : '';
- return '<div class=mono dim style="margin:4px 0">'+s.id+'</div>'+spawn+cat+
+ const open=s.file
+   ? '<div class=openbar>'+
+     '<button class="obtn open-file" title="Open this transcript (.jsonl) in your default app">📄 Open transcript</button>'+
+     '<button class="obtn open-dir" title="Open the folder that contains this transcript">📁 Show in folder</button>'+
+     '<button class="obtn copy-path" title="Copy the full transcript path to the clipboard">📋 Copy path</button>'+
+     '<code class=opath title="'+esc(s.file)+'">'+esc(s.file)+'</code>'+
+     '<span class=ostat></span></div>'
+   : '';
+ return '<div class=mono dim style="margin:4px 0">'+s.id+'</div>'+open+spawn+cat+
   '<div class=chartbox></div>'+
   '<table class=inner><thead><tr><th class=l>model</th><th>input</th><th>output</th>'+
   '<th>cache write</th><th>cache read</th><th>$</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+// Wire the transcript open/reveal/copy buttons in a session's detail panel.
+// Stopping propagation keeps a button click from toggling the row closed.
+function wireOpen(det,s){
+ const bar=det.querySelector('.openbar'); if(!bar||!s.file)return;
+ const stat=bar.querySelector('.ostat');
+ const flash=(msg,bad)=>{stat.textContent=msg;stat.style.color=bad?'#f87171':'#34d399';
+  clearTimeout(stat._t);stat._t=setTimeout(()=>{stat.textContent='';},2500);};
+ const hit=async(reveal)=>{
+  try{
+   const r=await fetch('/open?file='+encodeURIComponent(s.file)+(reveal?'&reveal=1':''));
+   flash(r.ok?(reveal?'📁 opened folder':'📄 opened'):'⚠️ '+(await r.text()),!r.ok);
+  }catch(e){flash('⚠️ '+e.message,true);}
+ };
+ bar.querySelector('.open-file').onclick=e=>{e.stopPropagation();hit(false);};
+ bar.querySelector('.open-dir').onclick=e=>{e.stopPropagation();hit(true);};
+ bar.querySelector('.copy-path').onclick=async e=>{e.stopPropagation();
+  try{await navigator.clipboard.writeText(s.file);flash('📋 copied');}
+  catch{flash('⚠️ copy blocked',true);}};
+ bar.onclick=e=>e.stopPropagation();
 }
 // Cumulative-spend line chart with hover tooltip ($ spent by local time).
 function wireChart(box,s,f){
@@ -956,25 +1032,74 @@ function initControls(){
  syncControls();
 }
 initControls();
-function loadData(){
- const lo=$('loading'); if(lo)lo.innerHTML='⏳ Scanning Claude &amp; Codex session logs… <div class=pbar><div></div></div>';
+function loadData(opts={}){
+ if(loadingData)return;
+ loadingData=true;
+ const background=opts.background===true;
+ const lo=$('loading');
+ if(!background&&lo)lo.innerHTML='⏳ Scanning Claude &amp; Codex session logs… <div class=pbar><div></div></div>';
  fetch('/api').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
   data=d.sessions.map(enrich);
   if(d.prices)prices=d.prices;
   machines=d.machines||[];
   buildMachSeg();
-  render();
-  const n=+urlQ.get('expand')||0;
-  document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
+  render({preserveViewport:background});
+  if(firstLoad){
+   const n=+urlQ.get('expand')||0;
+   document.querySelectorAll('#t > tbody > tr.s').forEach((tr,i)=>{if(i<n)tr.click();});
+  }
+  firstLoad=false;
  }).catch(err=>{
-  $('totals').innerHTML='<div class=loaderr>⚠️ Failed to load session data: '+err.message+
+  if(!background)$('totals').innerHTML='<div class=loaderr>⚠️ Failed to load session data: '+err.message+
    '<button onclick="loadData()">↻ Retry</button></div>';
+ }).finally(()=>{
+  loadingData=false;
  });
 }
 loadData();
+setInterval(()=>loadData({background:true}),60e3);
 </script></body></html>`;
 
+// Every directory a transcript could legitimately live in — the built-in
+// Claude/Codex roots plus any per-machine synced cache dirs. `/open` only
+// honours paths under one of these so the endpoint can't be turned into an
+// arbitrary-file opener.
+function allowedRoots() {
+  const roots = [ROOT, CODEX_ROOT];
+  for (const m of MACHINES) {
+    if (m.claudeRoot) roots.push(m.claudeRoot);
+    if (m.codexRoot) roots.push(m.codexRoot);
+  }
+  return roots.filter(Boolean).map((r) => resolve(r));
+}
+// Reveal-in-file-manager vs open-with-default-app, per platform.
+function openCmd(target, reveal) {
+  if (process.platform === "darwin") return ["open", reveal ? ["-R", target] : [target]];
+  if (process.platform === "win32") {
+    return reveal ? ["explorer", ["/select,", target]] : ["cmd", ["/c", "start", "", target]];
+  }
+  // Linux: no portable "reveal" — open the file, or its parent dir when revealing.
+  return ["xdg-open", [reveal ? dirname(target) : target]];
+}
+
 createServer(async (req, res) => {
+  if (req.url.startsWith("/open?")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const want = resolve(q.get("file") || "");
+    const reveal = q.get("reveal") === "1";
+    const ok = allowedRoots().some((r) => want === r || want.startsWith(r + sep));
+    const send = (code, msg) => {
+      res.writeHead(code, { "content-type": "text/plain" });
+      res.end(msg);
+    };
+    if (!ok) return send(403, "path not under a known transcript root");
+    try { statSync(want); } catch { return send(404, "file not found on this machine"); }
+    const [cmd, cmdArgs] = openCmd(want, reveal);
+    execFile(cmd, cmdArgs, (err) => {
+      if (err) console.error(`[open] ${err.message}`);
+    });
+    return send(200, "opening");
+  }
   if (req.url === "/api") {
     const sessions = await collect();
     res.writeHead(200, { "content-type": "application/json" });
