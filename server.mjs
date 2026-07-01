@@ -86,6 +86,7 @@ const PRICES = {
   "claude-opus-4-6":   { in: 5, out: 25, cw: 6.25, cr: 0.5 },
   "claude-opus-4-5":   { in: 5, out: 25, cw: 6.25, cr: 0.5 },
   "claude-fable-5":    { in: 10, out: 50, cw: 12.5, cr: 1.0 },
+  "claude-sonnet-5":   { in: 3, out: 15, cw: 3.75, cr: 0.3 },
   "claude-sonnet-4-6": { in: 3, out: 15, cw: 3.75, cr: 0.3 },
   "claude-sonnet-4-5": { in: 3, out: 15, cw: 3.75, cr: 0.3 },
   "claude-haiku-4-5":  { in: 1, out: 5,  cw: 1.25, cr: 0.1 },
@@ -1057,7 +1058,9 @@ function loadData(opts={}){
  });
 }
 loadData();
-setInterval(()=>loadData({background:true}),60e3);
+// Refetch often enough that a freshly-active session's "♨️ warm" countdown
+// appears well inside the ~5-min cache window (also picks up new remote syncs).
+setInterval(()=>loadData({background:true}),30e3);
 </script></body></html>`;
 
 // Every directory a transcript could legitimately live in — the built-in
