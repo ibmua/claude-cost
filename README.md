@@ -1,104 +1,153 @@
 # 💸 claude-cost
 
-A tiny, zero-dependency local dashboard that shows what every past **Claude Code** and **Codex** session would have cost you.
-
-It scans your local session logs (`~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`), prices the token usage per model at API list prices, and serves a single-page dashboard.
-
-![Plan mode](docs/plan-mode.png)
-
-## Features
-
-- 📦 **Plan pricing** (default) — see your subscription's effective rate. Pick your Anthropic plan (Pro / Max 5× / Max 20×) and OpenAI plan (Plus / Pro 5× / Pro 20×); every dollar figure is scaled by *plan price ÷ max possible monthly API spend*, so you see the plan-equivalent cost of your usage. Mode and plan choices are remembered (localStorage)
-- 🧾 **API pricing** — one click away: raw input / output / cache-write / cache-read priced per model (Opus, Sonnet, Haiku, Fable, GPT-5.x, …)
-- 🤖 Subagent/sidechain work is merged into its parent session and broken out as "subwork"
-- 📊 Per-session drill-down: per-model token counts, spend by category (input / output / cache write / cache read / main / subworkers)
-- 📈 **Spend-over-time chart** in the drill-down — cumulative raw-API $ across the session, subagent turns included (hover for the $ at any moment)
-- ⚙️ **Workflow runs** (multi-agent orchestration under `subagents/workflows/`) fold into their mother session and show up as a `⚙ N workflow · 🤖×M` badge
-- 🎯 Accurate Claude accounting: one API response is logged as many jsonl lines (same `message.id`, identical cache tokens, growing `output_tokens`) — usage is deduped per message id, otherwise cache costs inflate ~2×
-- 🖥️ **Multi-machine** — optionally index other computers' session logs too: a gitignored `machines.local.mjs` declares extra log roots (e.g. rsync'd copies) and an optional background sync command; a 🌐 All / 💻 local / … header toggle switches between machines, and rows get a machine badge. All host names, paths, and sync scripts stay in the gitignored file
-- ♨️ **Cache-warmth indicator** — sessions whose prompt cache is likely still alive get a ♨️ next to their timestamp (hover for details), so you know when resuming a session will reuse cached context. Anthropic's ~5-minute, refreshed-on-use TTL makes this predictable for Claude; OpenAI prefixes can survive 5–60 minutes but are evicted unpredictably, so Codex sessions get a best-guess ♨️/🌡️ instead of a promise. Updates live every 30 s
-- 🔍 Live project filter — totals cards recompute over the filtered rows
-- ↕️ Sortable columns, duration, cache-hit share
-- ⚡ mtime-cached scanning, so multi-GB log directories stay fast after the first load
-- 🔗 Shareable URL params override the saved state: `?mode=api|plan&claude=<plan>&codex=<plan>&machine=<id|all>&expand=<n>`
-
-| API mode | Session drill-down |
-|---|---|
-| ![API mode](docs/api-mode.png) | ![Session detail](docs/session-detail.png) |
+A local dashboard for Claude Code, Codex, and configured direct-API usage ledgers.
+It reads session logs, estimates token costs, and compares recorded spend with observed
+subscription quotas. The server binds to `127.0.0.1`.
 
 ## Run
 
-Works on Linux, macOS, and Windows — logs are read from `~/.claude/projects` and `~/.codex/sessions` under your home directory (`%USERPROFILE%` on Windows), which is where Claude Code and Codex put them on every OS. Timestamps render in your browser's time zone (`?tz=Area/City` to override).
+Requires Node.js 22 or newer. React, React DOM and htm are bundled locally: no npm
+installation, build step, or browser CDN is required.
 
 ```sh
-node server.mjs            # → http://localhost:8799
-PORT=9000 node server.mjs  # bash/zsh
+git clone https://github.com/ibmua/claude-cost.git "$HOME/claude-cost"
+node "$HOME/claude-cost/server.mjs"
 ```
 
-```powershell
-$env:PORT=9000; node server.mjs   # Windows PowerShell
+Open http://localhost:8799/ for Classic, or
+http://localhost:8799/?view=studio&empty=1&panel=history for Usage desk with history.
+Set `PORT` to choose a different local port. Logs default to `~/.claude/projects`
+and `~/.codex/sessions`; additional `~/.claude-*` account directories are discovered.
+The optional quota sampler requires Python 3.9+ and a POSIX platform (`fcntl`).
+
+## Interface
+
+- **Usage desk:** compact React interface with persistent dark/light theme, sessions,
+  model spend, account limits, plans/prices, and history. Classic shares its data and filters.
+- **History:** hourly/daily API spend stacked by model, plus separate Claude and Codex
+  quota charts. Hover readouts sit below the plots; keyboard navigation, pinning and
+  zoom keep inspection accessible. Missing observations and resets remain visible gaps.
+- **Filters:** provider, machine, account, model, project and time window. Empty/error
+  attempts can be included with `?empty=1`; they remain visible even with no token cost.
+- **Session detail:** model/category costs, cumulative spend, subagent/workflow activity,
+  token counts, session names, and local transcript actions. Batch ledgers load individual
+  call details on demand.
+- **Accounting:** deduplicated Claude messages, per-turn Codex models, real rolling
+  five-hour slices, and cached scanning. History caches unchanged row contributions while
+  additions, corrections and removals remain live.
+
+Quota is account-wide. Task/model filters narrow cost, while provider/account scope controls
+quota. Historical API dollars come from recorded dated calls; missing history is never
+estimated from session totals. History calendar days use Europe/Kyiv; session timestamps
+use the browser timezone unless overridden with `?tz=Area/City`.
+
+## Plan-mode estimates
+
+API mode uses token-category prices. Plan mode scales those dollars by
+**monthly plan price ÷ estimated monthly API-equivalent allowance**, with the existing
+Claude monthly cap applied. These are configurable accounting estimates, not an official
+fixed API credit entitlement, invoice, or measurement of remaining quota.
+
+| Plan ID | Monthly price | Estimated API-equivalent allowance | Multiplier |
+|---|---:|---:|---:|
+| `claude-pro` | $20 | $300 | ×0.0667 |
+| `claude-max-5x` | $100 | $1,500 | ×0.0667 |
+| `claude-max-20x` | $200 | $6,000 | ×0.0333 |
+| `chatgpt-plus` | $20 | $350 | ×0.0571 |
+| `chatgpt-pro-5x` | $100 | $1,750 | ×0.0571 |
+| `chatgpt-pro-20x` | $200 | $7,000 | ×0.0286 |
+
+`PLANS` in `public/app.js` is canonical; this table mirrors it. Current defaults were
+recalibrated on 2026-09-08. Browser preferences store plan IDs, so reload adopts rate changes.
+Live quota percentages come from provider usage endpoints independently of this conversion.
+
+## How it works
+
+| File | Owns |
+|---|---|
+| `server.mjs` | HTTP shell/API, Claude/Codex/ledger scanners, model API rates, scan cache, remote agent mode, local Claude quota observations |
+| `public/app.js` | Shared React state, requests, filters, plan conversion, session expansion and virtualization |
+| `public/components.js` | Shared totals, model/price/limit panels and session presentation |
+| `public/studio.js`, `public/studio.css` | Usage desk layout and theme |
+| `public/history.js` | Row/contribution caches, temporal aggregation and cost/quota charts |
+| `quota_history.py` | Optional read-only Claude/Codex quota sampler and history reader |
+| `vendor/` | Browser libraries and upstream licenses |
+| `test/` | Synthetic scanner, pricing, timeframe, history and quota regressions |
+
+Main read endpoints are `/api`, `/api/usage`, `/api/quota-history` and
+`/api/ledger-calls`. Runtime caches, names and quota observations live under ignored `local/`.
+
+## Private configuration
+
+Create an ignored `machines.local.mjs` beside the server for additional sources. For example:
+
+```js
+export const local = {
+  claudeUsageLedgers: [
+    {path: '/absolute/path/to/usage.jsonl', label: 'Batch jobs',
+     supplementalEmptyProviders: ['codex']},
+  ],
+};
+export const machines = [{
+  id: 'worker', label: '🖥 worker',
+  remote: {host: 'worker-ssh-alias', dir: '/absolute/remote/collector'},
+  claudeRoots: [{dir: '/absolute/remote/.claude', root: '/absolute/remote/.claude/projects'}],
+  codexRoots: ['/absolute/remote/.codex/sessions'],
+}];
 ```
 
-No dependencies, no build step — one file, Node ≥ 18.
+Remote collection copies the same server file over SSH and runs `--agent` on the
+machine that owns the transcripts. Only summaries return; transcripts are not mirrored.
+A remote must have Node installed and an existing working SSH configuration.
+Additional per-call OpenCode ledgers can be configured with `ocgoLedgers`.
+Supplemental Codex ledger rows add only failed/empty attempts, avoiding duplicate native usage.
 
-### Autostart
+Claude quota collection uses existing credentials in discovered account directories;
+`CLAUDE_COST_CRED_DIRS` overrides that list (colon-separated paths). The running dashboard
+polls periodically, applies rate-limit backoff, and retains normalized local observations.
+It does not refresh credentials or make model calls. Stale last-good readings are labelled.
 
-**Linux (systemd user service):**
+For optional Codex or remote quota history, put a JSON config under `local/`:
 
-```ini
-# ~/.config/systemd/user/claude-cost.service
-[Unit]
-Description=claude-cost dashboard
-
-[Service]
-ExecStart=/usr/bin/node %h/claude-cost/server.mjs
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
+```json
+{
+  "machine": "worker",
+  "history": "/absolute/private/quota-history.jsonl",
+  "sources": [
+    {"id": "codex-primary", "provider": "codex", "auth": "/absolute/private/.codex/auth.json"}
+  ]
+}
 ```
+
+Schedule `python3 /absolute/path/to/quota_history.py --config /absolute/private/config.json`
+with your local scheduler. Successful observations are retained once per source/hour;
+failures can retry. Add `quotaHistory: {script: '/absolute/path/to/quota_history.py',
+config: '/absolute/private/config.json'}` to the corresponding machine entry so the
+dashboard reads its history. The sampler/config must already exist on that machine.
+`--history` reads stored samples without querying a provider.
+
+## Privacy and publication
+
+This repository contains code and synthetic tests. Account names, credentials, machine
+configuration, logs, caches, deployment scripts and real-data screenshots belong in ignored
+local files. Previously published screenshots are removed from the current tree; old commits
+may still contain them. This release does not rewrite Git history.
+
+The dashboard reads private transcripts and may show project paths and account labels.
+It makes authenticated, read-only requests to Anthropic for account/quota data; the optional
+sampler also queries ChatGPT usage. Configured remote collection uses SSH. Browser assets are
+served locally. Do not expose this unauthenticated dashboard to the public internet.
+
+## Tests
 
 ```sh
-systemctl --user enable --now claude-cost.service
+node --test "$HOME/claude-cost/test/"*.test.mjs
+python3 "$HOME/claude-cost/test/quota_history_test.py"
 ```
 
-**macOS (launchd):** save as `~/Library/LaunchAgents/com.claude-cost.plist`, then `launchctl load` it:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.claude-cost</string>
-  <key>ProgramArguments</key><array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/YOU/claude-cost/server.mjs</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>
-```
-
-**Windows:** Task Scheduler → "At log on" → `node C:\path\to\claude-cost\server.mjs`, or any process manager you already use (e.g. `pm2 start server.mjs`).
-
-## Plan-mode math
-
-Plan mode answers: *"what did this usage effectively cost me at my plan's best-case rate?"*
-
-| Plan | Price | Max possible spend (approx.) | Multiplier |
-|---|---|---|---|
-| claude-pro | $20/mo | $400/mo | ×0.05 |
-| claude-max-5x | $100/mo | $2,000/mo | ×0.05 |
-| claude-max-20x | $200/mo | $8,000/mo | ×0.025 |
-| chatgpt-plus | $20/mo | $700/mo | ×0.0286 |
-| chatgpt-pro-5x | $100/mo | $3,500/mo | ×0.0286 |
-| chatgpt-pro-20x | $200/mo | $14,000/mo | ×0.0143 |
-
-It's a lower bound implied by the max-spend column, not what you'd actually be billed.
-
-## Privacy
-
-Everything runs locally and reads only your own log files. Nothing leaves your machine — keep it bound to localhost.
+The fixtures use temporary homes and synthetic records; they do not need real credentials.
 
 ## License
 
-MIT
+Project code: MIT. Vendored React/React DOM: MIT. Vendored htm: Apache-2.0.
+See `LICENSE` and the license files in `vendor/`.

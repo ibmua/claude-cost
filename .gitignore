@@ -6,3 +6,23 @@ node_modules/
 # Never commit these — they contain host names / paths for other computers.
 machines.local.mjs
 local/
+
+# local QA / scratch
+.playwright-mcp/
+cc-react.jpeg
+server.mjs.prereact.bak
+
+# Private notes, runtime output, audits, and real-data screenshots.
+HANDOFF.md
+audits/
+__pycache__/
+*.py[cod]
+*.log
+*.jsonl
+.env
+.env.*
+*.pem
+*.key
+tmp_*
+*.bak
+docs/*.png
