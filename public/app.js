@@ -268,48 +268,6 @@ function Seg({children}){ return html`<div class="seg">${children}</div>`; }
 function SegBtn({on,onClick,children,title}){
  return html`<button class=${on?'on':''} title=${title||''} onClick=${onClick}>${children}</button>`;
 }
-function Header({stx,setSt,q,setQ,sortK,desc,onSort,machines,accounts,models}){
- const set=(patch)=>setSt(Object.assign({},stx,patch));
- const modeBtns=[['api','🧾 API'],['plan','📦 Plan']];
- return html`<header>
-  <div class="bar">
-   <h1>💸 Session costs</h1>
-   <a href="?view=studio&empty=1" style=${{color:"#a6bafb",fontSize:"12px"}}>◒ Usage desk</a>
-   <${Seg}>${modeBtns.map(([m,l])=>html`<${SegBtn} key=${m} on=${stx.mode===m} onClick=${()=>set({mode:m})}>${l}<//>`)}<//>
-   <${Seg}>${TIMEFRAMES.map(t=>html`<${SegBtn} key=${t[0]} on=${stx.tf===t[0]} onClick=${()=>set({tf:t[0]})}>${t[1]}<//>`)}<//>
-   ${machines.length>1?html`<${Seg}>
-      <${SegBtn} on=${stx.machine==='all'} onClick=${()=>set({machine:'all'})}>🌐 All<//>
-      ${machines.map(m=>html`<${SegBtn} key=${m.id} on=${stx.machine===m.id} onClick=${()=>set({machine:m.id})}>${m.label}<//>`)}
-    <//>`:null}
-   ${accounts.length>1?html`<${Seg} title="Which Claude account each session was launched under">
-      <${SegBtn} on=${stx.account==='all'} onClick=${()=>set({account:'all'})}>👤 All<//>
-      ${accounts.map(a=>html`<${SegBtn} key=${a} on=${stx.account===a} onClick=${()=>set({account:a})}><span class="acctdot" style=${{background:acctColor(a)}}/>${a}<//>`)}
-    <//>`:null}
-   ${(models&&models.length>1)?html`<label class="plansel" title="Show only sessions whose main model is this (mid-session switches match any of their models)">🧩 <select value=${stx.model} onChange=${e=>set({model:e.target.value})}>
-      <option value="all">all models</option>
-      ${models.map(m=>html`<option key=${m} value=${m}>${shortModel(m)}</option>`)}
-    </select></label>`:null}
-   <label class="plansel" title="Anthropic plan (plan price ÷ estimated monthly API-equivalent allowance)">🟠 <select disabled=${stx.mode!=='plan'} value=${stx.claude} onChange=${e=>set({claude:e.target.value})}>
-     ${PLANS.claude.map(p=>html`<option key=${p[0]} value=${p[0]}>${p[0]} · $${p[1]}/mo (≈$${fmt(p[2])})</option>`)}
-   </select></label>
-   <label class="plansel" title="OpenAI / ChatGPT plan (plan price ÷ estimated monthly API-equivalent allowance)">🟢 <select disabled=${stx.mode!=='plan'} value=${stx.codex} onChange=${e=>set({codex:e.target.value})}>
-     ${PLANS.codex.map(p=>html`<option key=${p[0]} value=${p[0]}>${p[0]} · $${p[1]}/mo (≈$${fmt(p[2])})</option>`)}
-   </select></label>
-   <span class="mult">${stx.mode==='plan'?('claude '+ratioStr('claude')+' · codex '+ratioStr('codex')):''}</span>
-   <${ProviderFilter} value=${stx.provider} onChange=${provider=>set({provider,model:'all'})}/>
-   <textarea rows="1" class="search" placeholder="🔍 filter projects…" value=${q} onInput=${e=>setQ(e.target.value.trim().toLowerCase())}/>
-  </div>
-  <div class="sub">${stx.mode==='plan'
-    ? '📦 Plan mode: every $ = API list cost × (plan price ÷ estimated monthly API-equivalent allowance). '+planOf('claude')[0]+' $'+planOf('claude')[1]+'/mo ÷ $'+fmt(planOf('claude')[2])+' · '+planOf('codex')[0]+' $'+planOf('codex')[1]+'/mo ÷ $'+fmt(planOf('codex')[2])+'. Claude months are capped at the plan price ⛔ (prorated for the current month); Codex stays uncapped. Click a column to sort.'
-    : '🧾 API list prices · Astra $10/$1/$50 (above 272K: $20/$2/$75) · Muse Contributor $0.10/$0.002/$0.20 · GPT-5.6 Sol $4/$0.40/$20 · Terra $2/$0.20/$12 · Luna $0.20/$0.02/$1.20 input/cached/output · Fable 5.1 cache reads $0.25/Mtok (Astra/Muse checked 2026-09-06). Standard rates; explicit Codex cache writes and speed-tier surcharges are not exposed/accounted. Expand Model prices below for every rate.'}</div>
-  <div class="sub">${curWindowHours
-    ? ('⏱️ Scanned the last '+curWindowHours+' hours of logs. Pick a longer range above to scan further back.')
-    : curWindowDays
-    ? ('⏱️ Scanned the last '+curWindowDays+' days of logs. Pick a longer range above to scan further back.')
-    : '📚 Scanned all sessions.'}</div>
- </header>`;
-}
-
 function TableHead({sortK,desc,onSort}){
  return html`<div class="cc-head" style=${{gridTemplateColumns:GRID}}>
    ${COLS.map(c=>html`<div key=${c.k} class=${'cc-th'+(c.l?' l':'')+(c.k===sortK?' on':'')} onClick=${()=>onSort(c.k)}>${c.label}${c.k===sortK?(desc?' ▾':' ▴'):''}</div>`)}
@@ -441,32 +399,17 @@ function App(){
   ? `📦 ${compaction.groupedSessions.toLocaleString()} older same-run sessions are shown as exact aggregate rows; newest sessions remain individual.`
   : '';
 
- if(new URLSearchParams(location.search).get('view')==='studio') return html`<${UsageDesk}
+ return html`<${UsageDesk}
   stx=${stx} setSt=${persist} q=${qx} setQ=${setQx} rows=${rows} usage=${usage}
   loading=${loading} err=${err} reload=${()=>loadData({force:true})} expanded=${expanded}
   onToggle=${onToggle} bigCut=${bigCut} sk=${sk} dsc=${dsc} onSort=${onSort} empty=${empty} compactNote=${compactNote}/>`;
- return html`<div>
-  <${Header} stx=${stx} setSt=${persist} q=${qx} setQ=${setQx} sortK=${sk} desc=${dsc} onSort=${onSort} machines=${machines} accounts=${ACCOUNTS} models=${MODELS}/>
-  <${LimitsPanel} usage=${usage} provider=${stx.provider} account=${stx.account}/>
-  ${compactNote?html`<div class="compactnote">${compactNote} <code>?raw=1</code> disables grouping.</div>`:null}
-  ${loading
-    ? html`<div class="totals"><div class="loading">⏳ Scanning Claude &amp; Codex session logs… <div class="pbar"><div/></div></div></div>`
-    : err
-    ? html`<div class="totals"><div class="loaderr">⚠️ Failed to load session data: ${err}<button onClick=${()=>loadData()}>↻ Retry</button></div></div>`
-    : html`<${TotalsPanel} rows=${rows}/>`}
-  <details class="prices" open><summary>◈ Spend by model</summary><${ModelSpend} rows=${rows}/></details>
-  <details class="prices"><summary>Model prices per million tokens</summary><${PriceTables}/></details>
-  <div class="wrap">
-   <${TableHead} sortK=${sk} desc=${dsc} onSort=${onSort}/>
-   <${VirtualTable} rows=${rows} expanded=${expanded} onToggle=${onToggle} bigCut=${bigCut}/>
-  </div>
- </div>`;
+
 }
 
-if(new URLSearchParams(location.search).get('view')==='studio'){
+{
  document.body.classList.add('usage-desk');
  try{document.body.dataset.deskTheme=localStorage.getItem('cc-desk-theme')==='light'?'light':'dark';}catch{document.body.dataset.deskTheme='dark';}
  document.title='Usage desk · Claude Cost';
- const css=document.createElement('link');css.rel='stylesheet';css.href='/studio.css';document.head.appendChild(css);
+ const css=document.createElement('link');css.rel='stylesheet';css.href='/studio.css?v=sole-desk-20261007';document.head.appendChild(css);
 }
 ReactDOM.createRoot(document.getElementById('root')).render(html`<${App}/>`);

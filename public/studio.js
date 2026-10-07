@@ -17,13 +17,12 @@ function UsageDesk({stx,setSt,q,setQ,rows,usage,loading,err,reload,expanded,onTo
  },[rows]);
  const pending=loading&&!data.length;
  const go=id=>{setView(id);const u=new URL(location.href);if(id==='history')u.searchParams.set('panel','history');else u.searchParams.delete('panel');history.replaceState(null,'',u);window.scrollTo({top:0});};
- const classic=new URL(location.href);classic.searchParams.delete('view');
  const moneyNode=n=>pending?html`<span class=desk-placeholder aria-label=Loading>—</span>`:html`<${Money} value=${n}/>`;
  return html`<div class=${'desk '+(wide?'desk-wide':'')}>
-  <aside class="desk-rail"><a class="desk-brand" href="?view=studio&empty=1"><span class="desk-mark">◒</span><strong>Usage desk</strong></a>
+  <aside class="desk-rail"><a class="desk-brand" href="?empty=1"><span class="desk-mark">◒</span><strong>Usage desk</strong></a>
    <p class="desk-caption">Your AI, accounted for.</p>
    <nav aria-label="Dashboard views">${DESK_VIEWS.map(([id,icon,label])=>html`<button key=${id} aria-current=${view===id?'page':null} class=${view===id?'active':''} onClick=${()=>go(id)}><span aria-hidden="true">${icon}</span>${label}</button>`)}</nav>
-   <div class="desk-rail-bottom"><span>Private · on this machine</span><a href=${classic.href}>↗ Classic interface</a></div>
+   <div class="desk-rail-bottom"><span>Private · on this machine</span></div>
   </aside>
   <main class="desk-main">
    <header class="desk-header"><div><h1>${DESK_VIEWS.find(v=>v[0]===view)[2]}</h1><p>${view==='sessions'?'Follow the work. See where the usage goes.':view==='history'?'Compare API-price usage with changes in account quota.':view==='models'?'Compare cost, tokens, and reasoning across your models.':view==='limits'?'Live account quotas, separate from estimated spend.':'Choose how usage translates into cost.'}</p></div>
@@ -31,7 +30,7 @@ function UsageDesk({stx,setSt,q,setQ,rows,usage,loading,err,reload,expanded,onTo
    </header>
    <div class="desk-toolbar"><${Seg}>${TIMEFRAMES.map(t=>html`<${SegBtn} key=${t[0]} on=${stx.tf===t[0]} onClick=${()=>set({tf:t[0]})}>${t[1]}<//>`)}<//><span class="desk-scope">${loading?(data.length?'Updating… previous results shown':'Loading sessions…'):fmt(count)+' sessions in view'}</span></div>
    <section class="desk-overview" aria-label="Spend overview" aria-busy=${loading}><div class="desk-total"><span>${stx.mode==='plan'?'Plan-equivalent spend':'API-equivalent spend'}</span><strong>${moneyNode(total)}</strong><small>${pending?'Reading local and remote usage…':stx.mode==='plan'?html`${moneyNode(api)} at API prices`:'Estimated from recorded token usage'}</small></div>
-    <div class="desk-allocation"><div class="desk-meter" aria-label="Spend by provider">${providers.map(p=>html`<span key=${p.id} style=${{width:(total?p.value/total*100:0)+'%',background:p.color}} title=${p.label}/>` )}</div><div class="desk-providers">${providers.map(p=>html`<div key=${p.id}><span><i style=${{background:p.color}}/>${p.label}</span><strong>${moneyNode(p.value)}</strong></div>`)}</div><p>${stx.mode==='plan'?'Plan estimates use your selected plans. Claude’s monthly cap still applies.':'Input, output and cache costs use the same rate tables as Classic.'}</p></div>
+    <div class="desk-allocation"><div class="desk-meter" aria-label="Spend by provider">${providers.map(p=>html`<span key=${p.id} style=${{width:(total?p.value/total*100:0)+'%',background:p.color}} title=${p.label}/>` )}</div><div class="desk-providers">${providers.map(p=>html`<div key=${p.id}><span><i style=${{background:p.color}}/>${p.label}</span><strong>${moneyNode(p.value)}</strong></div>`)}</div><p>${stx.mode==='plan'?'Plan estimates use your selected plans. Claude’s monthly cap still applies.':'Input, output and cache costs use the configured model rates.'}</p></div>
    </section>
    ${err?html`<div class="desk-error" role="alert">⚠ ${err} <button onClick=${reload}>Retry</button></div>`:null}
    ${html`<div class="desk-filters"><label class="desk-search"><span aria-hidden="true">⌕</span><textarea rows="1" aria-label="Search projects" placeholder="Find a project or session…" value=${q} onInput=${e=>setQ(e.target.value.toLowerCase())}/></label>

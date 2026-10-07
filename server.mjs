@@ -1723,8 +1723,8 @@ const PAGE = `<!doctype html><html><head><meta charset=utf8>
 <script src="/vendor/htm.umd.js"></script>
 <script src="/components.js"></script>
 <script src="/history.js"></script>
-<script src="/studio.js"></script>
-<script src="/app.js"></script>
+<script src="/studio.js?v=sole-desk-20261007"></script>
+<script src="/app.js?v=sole-desk-20261007"></script>
 </body></html>`;
 
 // Every path a transcript could legitimately live under — the built-in

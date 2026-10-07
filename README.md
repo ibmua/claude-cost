@@ -14,8 +14,9 @@ git clone https://github.com/ibmua/claude-cost.git "$HOME/claude-cost"
 node "$HOME/claude-cost/server.mjs"
 ```
 
-Open http://localhost:8799/ for Classic, or
-http://localhost:8799/?view=studio&empty=1&panel=history for Usage desk with history.
+Open http://localhost:8799/ for Usage desk, or
+http://localhost:8799/?empty=1&panel=history for history with empty attempts.
+Usage desk is the only interface at every URL, including older `view=studio` links.
 Set `PORT` to choose a different local port. Logs default to `~/.claude/projects`
 and `~/.codex/sessions`; additional `~/.claude-*` account directories are discovered.
 The optional quota sampler requires Python 3.9+ and a POSIX platform (`fcntl`).
@@ -23,7 +24,7 @@ The optional quota sampler requires Python 3.9+ and a POSIX platform (`fcntl`).
 ## Interface
 
 - **Usage desk:** compact React interface with persistent dark/light theme, sessions,
-  model spend, account limits, plans/prices, and history. Classic shares its data and filters.
+  model spend, account limits, plans/prices, and history. All panels share its data and filters.
 - **History:** hourly/daily API spend stacked by model, plus separate Claude and Codex
   quota charts. Hover readouts sit below the plots; keyboard navigation, pinning and
   zoom keep inspection accessible. Missing observations and resets remain visible gaps.
@@ -66,7 +67,7 @@ Live quota percentages come from provider usage endpoints independently of this 
 | File | Owns |
 |---|---|
 | `server.mjs` | HTTP shell/API, Claude/Codex/ledger scanners, model API rates, scan cache, remote agent mode, local Claude quota observations |
-| `public/app.js` | Shared React state, requests, filters, plan conversion, session expansion and virtualization |
+| `public/app.js` | Sole Usage desk mount, theme initialization, shared React state, requests, filters, plan conversion, session expansion and virtualization |
 | `public/components.js` | Shared totals, model/price/limit panels and session presentation |
 | `public/studio.js`, `public/studio.css` | Usage desk layout and theme |
 | `public/history.js` | Row/contribution caches, temporal aggregation and cost/quota charts |
@@ -146,6 +147,9 @@ python3 "$HOME/claude-cost/test/quota_history_test.py"
 ```
 
 The fixtures use temporary homes and synthetic records; they do not need real credentials.
+`test/interface.test.mjs` starts a clean install and checks the default and historical URLs
+in headless Chrome/Chromium. Install either browser or set `CHROME_BIN` to run that test;
+it is explicitly skipped when no browser is installed.
 
 ## License
 
